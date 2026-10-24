@@ -1,0 +1,164 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ============================================================
+   全局设计令牌
+   Tailwind preflight 已关闭（避免与 antd reset 打架），
+   所以这里手写最小 reset，只处理确实需要的部分。
+   ============================================================ */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Hiragino Sans GB',
+    'Microsoft YaHei', 'Segoe UI', sans-serif;
+  font-size: 14px;
+  line-height: 1.5715;
+  color: #1e293b;
+  /* 浅色主题 + 极淡的蓝调渐变，制造「科技感」底色 */
+  background:
+    radial-gradient(1200px 600px at 100% -10%, rgba(59, 130, 246, 0.07), transparent 60%),
+    radial-gradient(900px 500px at -10% 110%, rgba(37, 99, 235, 0.05), transparent 55%),
+    #f8fafc;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* 滚动条：细、淡、蓝色悬停，与整体风格一致 */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #cbd5e1;
+  border-radius: 4px;
+  transition: background 0.2s;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #60a5fa;
+}
+
+/* 键盘可达性：只在键盘导航时显示焦点环，鼠标点击不显示 */
+:focus-visible {
+  outline: 2px solid #3b82f6;
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* ============================================================
+   通用组件类
+   ============================================================ */
+@layer components {
+  /* 卡片：控制台基本单元 */
+  .hsa-card {
+    @apply rounded-xl border border-ink-200/70 bg-white shadow-card;
+    transition: box-shadow 0.24s cubic-bezier(0.22, 1, 0.36, 1),
+      transform 0.24s cubic-bezier(0.22, 1, 0.36, 1),
+      border-color 0.24s ease;
+  }
+  .hsa-card-hover:hover {
+    @apply border-brand-200 shadow-card-hover;
+    transform: translateY(-2px);
+  }
+
+  /* 统计卡片的顶部高光条，用于区分不同指标 */
+  .hsa-stat-accent {
+    @apply relative overflow-hidden;
+  }
+  .hsa-stat-accent::after {
+    content: '';
+    @apply absolute left-0 top-0 h-full w-[3px];
+    background: linear-gradient(180deg, #3b82f6, #60a5fa);
+  }
+
+  /* 状态点：在线脉冲 / 离线静止 */
+  .hsa-dot {
+    @apply relative inline-block h-2 w-2 shrink-0 rounded-full;
+  }
+  .hsa-dot-online {
+    background: #10b981;
+  }
+  .hsa-dot-online::after {
+    content: '';
+    @apply absolute inset-0 rounded-full;
+    background: #10b981;
+    animation: pulse-ring 1.8s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+  }
+  .hsa-dot-offline {
+    background: #94a3b8;
+  }
+  .hsa-dot-warn {
+    background: #f59e0b;
+  }
+  .hsa-dot-danger {
+    background: #ef4444;
+  }
+
+  /* 等宽标签/键值展示 */
+  .hsa-mono {
+    @apply font-mono text-[12.5px] tracking-tight;
+  }
+
+  /* 骨架屏微光 */
+  .hsa-skeleton {
+    background: linear-gradient(90deg, #f1f5f9 25%, #e2e8f0 37%, #f1f5f9 63%);
+    background-size: 1000px 100%;
+    animation: shimmer 1.6s linear infinite;
+  }
+
+  /* 内容区进入动画容器 */
+  .hsa-enter {
+    animation: fade-in-up 0.28s cubic-bezier(0.22, 1, 0.36, 1);
+  }
+}
+
+/* ============================================================
+   与 antd 的桥接
+   目的：让 antd 组件在 Tailwind 布局里不吃亏、不打架。
+   ============================================================ */
+
+/* antd 的表格在卡片内要贴边，去掉它默认的外边距干扰 */
+.hsa-table-flush .ant-table-wrapper,
+.hsa-table-flush .ant-table {
+  background: transparent;
+}
+
+/* antd 卡片与我们的 .hsa-card 视觉对齐 */
+.ant-card {
+  border-radius: 12px;
+}
+
+/* 移动端：表格横向滚动提示更明显 */
+@media (max-width: 768px) {
+  .ant-table-wrapper {
+    overflow-x: auto;
+  }
+}
+
+/* 尊重用户的减弱动效偏好（无障碍要求） */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

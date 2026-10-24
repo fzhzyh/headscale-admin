@@ -11,6 +11,7 @@ import { audit } from '../services/audit.ts';
 import { setSetting } from '../services/settings.ts';
 import { nowIso, secondsSince } from '../util/time.ts';
 import type { HsNode } from '../headscale/client.ts';
+import { notifyChanged } from '../realtime/hub.ts';
 
 /**
  * 判断 headscale 节点是否永不过期。
@@ -145,6 +146,7 @@ export async function registerNodeRoutes(app: FastifyInstance): Promise<void> {
       targetId: id,
       detail: { from: before.name, to: parsed.data.newName },
     });
+    notifyChanged('nodes', 'nodes.changed', { changed: [shapeNode(node)] });
     return reply.send({ node: shapeNode(node) });
   });
 
@@ -233,6 +235,7 @@ export async function registerNodeRoutes(app: FastifyInstance): Promise<void> {
       targetId: id,
       detail: { nodeName: before.name, before: before.expiry ?? null, after: node.expiry ?? null, requested: d },
     });
+    notifyChanged('nodes', 'nodes.changed', { changed: [shapeNode(node)] });
     return reply.send({ node: shapeNode(node) });
   });
 

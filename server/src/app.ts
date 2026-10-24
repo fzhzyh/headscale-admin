@@ -29,6 +29,7 @@ import { registerKeyRoutes } from './routes/keys.ts';
 import { registerRouteRoutes } from './routes/routes.ts';
 import { registerSettingsRoutes } from './routes/settings.ts';
 import { registerSystemRoutes } from './routes/system.ts';
+import { registerRealtimeRoutes } from './realtime/hub.ts';
 
 declare module 'fastify' {
   interface FastifyRequest {
@@ -44,6 +45,13 @@ const PUBLIC_PATHS = new Set([
   '/api/system/health',
   '/api/system/version',
   '/api/oidc/.well-known/openid-configuration',
+  /**
+   * WebSocket 交给 hub 自己鉴权。
+   * 原因：若在升级前返回 HTTP 401，浏览器只会看到 onclose code 1006，
+   * 前端无法区分「会话过期」与「网络抖动」，会无限重连。
+   * 让连接升级后由服务端主动 close(4401)，前端就能识别并停止重连、跳登录页。
+   */
+  '/api/ws',
 ]);
 
 function isPublic(path: string): boolean {
@@ -63,7 +71,6 @@ export async function buildApp(): Promise<FastifyInstance> {
     logger: loggerOptions(),
     trustProxy: true,
     bodyLimit: 4 * 1024 * 1024, // ACL 策略文件可能较大
-    disableRequestLogging: false,
   });
 
   await app.register(cookie);
@@ -122,11 +129,17 @@ export async function buildApp(): Promise<FastifyInstance> {
   });
 
   app.setNotFoundHandler((req, reply) => {
-    const url = req.raw.url ?? '';
+    const url = (req.raw.url ?? '').split('?')[0] ?? '';
     if (url.startsWith('/api/')) {
       return reply.code(404).send({ error: 'NOT_FOUND', message: `接口不存在：${req.url}` });
     }
-    // SPA history 回退
+    // ⚠️ 关键：带扩展名的路径（.js/.css/.png…）必须真的 404，不能回退到 index.html。
+    // 否则前端重建后旧哈希资源的请求会拿到 index.html（200 + text/html），
+    // 浏览器把它当 JS 解析失败 → 整页白屏，且极难定位。
+    if (/\.[a-zA-Z0-9]{1,8}$/.test(url)) {
+      return reply.code(404).send({ error: 'NOT_FOUND', message: `静态资源不存在：${url}` });
+    }
+    // 其余路径按 SPA history 回退
     const index = join(cfg.webDist, 'index.html');
     if (existsSync(index)) return reply.type('text/html').sendFile('index.html');
     return reply.code(404).send({ error: 'NOT_FOUND', message: '前端资源未构建（请先 npm run build:web）' });
@@ -140,10 +153,16 @@ export async function buildApp(): Promise<FastifyInstance> {
   await registerKeyRoutes(app);
   await registerRouteRoutes(app);
   await registerSettingsRoutes(app);
+  // WebSocket 实时推送（必须最后注册，避免与静态资源/SPA 回退冲突）
+  await registerRealtimeRoutes(app);
 
   // ---------- 前端静态资源 ----------
   if (existsSync(cfg.webDist)) {
-    await app.register(fastifyStatic, { root: cfg.webDist, prefix: '/', wildcard: false });
+    // ⚠️ 必须用 wildcard: true（默认）且 index 保持默认 true。
+    // wildcard: false 会在**启动时**枚举文件注册路由，前端重新构建后文件名哈希变化，
+    // 新资源不在注册表里 → 全部落到 SPA 回退返回 index.html → 浏览器当 JS 解析 → 白屏。
+    // index: false 则会让根路径 / 返回 403。
+    await app.register(fastifyStatic, { root: cfg.webDist, prefix: '/' });
   }
 
   return app;

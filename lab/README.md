@@ -33,6 +33,8 @@ python3 mk_nodes.py
 | `probe_rename.py` | 验证 RenameNode 改的是 `givenName` 而非 `name` |
 | `e2e_panel.py` | 面板端到端 54 项：认证 → CSRF → 透传 → 写操作 → RBAC 越权 → 登出 |
 | `e2e_2fa.py` | 2FA 端到端 25 项：TOTP 启用/校验/两步登录/恢复码/关闭（自实现 RFC 6238 交叉验证） |
+| `verify_web.mjs` | 前端 23 项：Chromium 真实 DOM 断言（渲染、跳转、真实数据、七页可达、移动端无溢出、无 JS 错误） |
+| `verify_ws.py` | WebSocket 18 项：握手/订阅/心跳/未认证拒绝/**写操作触发实时推送**（自实现 WS 客户端，无第三方依赖） |
 
 ## 跑面板端到端
 
@@ -45,6 +47,18 @@ python3 e2e_panel.py
 ```
 
 脚本不硬编码任何密钥，全部从环境变量读取。
+
+## 跑前端与 WebSocket 验证
+
+```bash
+# 前端需要 Playwright（首次会下载 Chromium）
+npm i -D playwright && npx playwright install chromium
+
+PANEL_ADMIN_SECRET=<引导口令> node lab/verify_web.mjs
+PANEL_ADMIN_SECRET=<引导口令> python3 lab/verify_ws.py
+```
+
+`verify_ws.py` 只用标准库实现 WebSocket 帧编解码，不依赖任何第三方包。
 
 ## 环境变量
 

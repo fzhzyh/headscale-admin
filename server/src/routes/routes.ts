@@ -10,6 +10,7 @@ import { z } from 'zod';
 import { hs } from '../services/headscale.ts';
 import { authOr401, requirePermission, csrfOk } from '../auth/guard.ts';
 import { audit } from '../services/audit.ts';
+import { notifyChanged } from '../realtime/hub.ts';
 
 interface RouteRow {
   nodeId: number;
@@ -118,6 +119,10 @@ export async function registerRouteRoutes(app: FastifyInstance): Promise<void> {
       targetId: nodeId,
       detail: { nodeName: node.name, route, before, after: Array.from(current) },
     });
+    notifyChanged('routes', 'routes.changed', {
+      data: { nodeId, approvedRoutes: updated.approvedRoutes ?? Array.from(current) },
+    });
+    notifyChanged('nodes', 'nodes.changed', { changed: [{ id: nodeId }] });
     return reply.send({
       ok: true,
       nodeId,
@@ -161,6 +166,8 @@ export async function registerRouteRoutes(app: FastifyInstance): Promise<void> {
       targetId: nodeId,
       detail: { nodeName: node.name, before, after: parsed.data.routes, unadvertisedApproved: unadvertised },
     });
+    notifyChanged('routes', 'routes.changed', { data: { nodeId, approvedRoutes: updated.approvedRoutes ?? [] } });
+    notifyChanged('nodes', 'nodes.changed', { changed: [{ id: nodeId }] });
     return reply.send({ ok: true, approvedRoutes: updated.approvedRoutes ?? [], unadvertisedApproved: unadvertised });
   });
 }

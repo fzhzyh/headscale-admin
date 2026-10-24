@@ -9,6 +9,7 @@ import { loadConfig } from './config.ts';
 import { closeDb } from './db/index.ts';
 import { purgeExpiredSessions } from './auth/session.ts';
 import { PANEL_VERSION } from './routes/system.ts';
+import { startPoller, stopPoller, pollOnce } from './realtime/hub.ts';
 
 // node:sqlite 在 Node 22 仍会打 ExperimentalWarning，这里静音以免污染日志
 const originalEmit = process.emit;
@@ -45,6 +46,7 @@ async function main(): Promise<void> {
   const shutdown = async (signal: string): Promise<void> => {
     app.log.info({ signal }, '收到退出信号，正在优雅关闭');
     try {
+      stopPoller();
       await app.close();
       closeDb();
       process.exit(0);
@@ -62,6 +64,9 @@ async function main(): Promise<void> {
 
   await app.listen({ host: cfg.host, port: cfg.port });
 
+  // 采样器要在 HTTP 起来之后启动（首轮采样需要能读 settings）
+  startPoller(app.log);
+
   app.log.info(
     {
       面板版本: PANEL_VERSION,
@@ -73,6 +78,14 @@ async function main(): Promise<void> {
     },
     'headscale-admin 已启动',
   );
+
+  // 首屏对齐：先跑一次采样建立基线，避免前端首次连上时看到空状态
+  try {
+    const r = await pollOnce();
+    app.log.info({ nodes: r.nodesTotal, online: r.nodesOnline }, '首轮采样完成');
+  } catch (err) {
+    app.log.warn({ err: err instanceof Error ? err.message : String(err) }, '首轮采样失败（不影响服务启动）');
+  }
 }
 
 main().catch((err: unknown) => {

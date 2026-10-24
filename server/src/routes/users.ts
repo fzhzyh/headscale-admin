@@ -17,6 +17,7 @@ import { nowIso } from '../util/time.ts';
 import { hashPassword, checkPasswordStrength, generateStrongPassword } from '../auth/secrets.ts';
 import { revokeUserSessions, resolvePermissions } from '../auth/session.ts';
 import { PERMISSIONS, isPermission, ALL_PERMISSIONS } from '../auth/rbac.ts';
+import { notifyChanged } from '../realtime/hub.ts';
 
 export async function registerUserRoutes(app: FastifyInstance): Promise<void> {
   // ============================================================
@@ -52,6 +53,7 @@ export async function registerUserRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(400).send({ error: 'BAD_INPUT', message: parsed.error.issues[0]?.message ?? '参数非法' });
     }
     const user = await hs().createUser(parsed.data);
+    notifyChanged('nodes', 'users.changed', { data: { action: 'create', name: user.name } });
     audit({ userId: ctx.user.id, username: ctx.user.username, ip: req.ip, action: 'hs.user.create', targetType: 'hs_user', targetId: user.id, detail: parsed.data });
     return reply.send({ user });
   });
@@ -63,6 +65,7 @@ export async function registerUserRoutes(app: FastifyInstance): Promise<void> {
     const parsed = z.object({ newName: z.string().min(1).max(63) }).safeParse(req.body);
     if (!parsed.success) return reply.code(400).send({ error: 'BAD_INPUT', message: '新用户名非法' });
     const user = await hs().renameUser(id, parsed.data.newName);
+    notifyChanged('nodes', 'users.changed', { data: { action: 'rename', name: user.name } });
     audit({ userId: ctx.user.id, username: ctx.user.username, ip: req.ip, action: 'hs.user.rename', targetType: 'hs_user', targetId: id, detail: { to: parsed.data.newName } });
     return reply.send({ user });
   });

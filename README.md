@@ -125,25 +125,29 @@ headscale apikeys create --expiration 90d
 
 | 阶段 | 内容 | 状态 |
 |------|------|------|
-| **P1** | 仓库骨架、加密存储、Headscale REST 客户端、认证/RBAC/2FA、审计、设备/用户/密钥/路由/设置 | ✅ 已完成，79 项端到端用例全通过 |
-| **P2** | WebSocket 实时推送、前端 SPA（控制台、设备、用户、密钥页） | 待开发 |
+| **P1** | 仓库骨架、加密存储、Headscale REST 客户端、认证/RBAC/2FA、审计、设备/用户/密钥/路由/设置 | ✅ 已完成 |
+| **P2** | 实时推送（WebSocket）、前端 SPA（控制台、设备、用户、密钥、路由、账户角色、快速连接、审计、设置） | ✅ 已完成 |
 | **P3** | ACL 引擎：可视化编辑、原始 HuJSON、版本历史、访问检查求值器、AI 辅助 | 待开发 |
-| **P4** | 监控：状态采样器、InfluxDB 写入、在线时长、拓扑图、ACL 访问矩阵 | 待开发 |
+| **P4** | 监控：状态采样器落 InfluxDB、在线时长、拓扑图、ACL 访问矩阵 | 待开发 |
 | **P5** | 资源中心、DNS 热加载、内置 OIDC Provider、外部 OIDC 登录 | 待开发 |
 
-### P1 已验证内容（对真实 headscale v0.29.6）
+### 已验证（共 120 项用例，全通过）
 
-**`lab/e2e_panel.py`（54 项）**：认证链路、会话、CSRF 拦截、RBAC 越权拦截、
-上游数据透传与字段归一化、设备重命名/过期/标签、路由启停与护栏、预授权密钥、审计、
-设置掩码回显。
-
-**`lab/e2e_2fa.py`（25 项）**：TOTP 密钥生成、错误码拒绝、启用、口令+动态码两步登录、
-恢复码一次性与消耗计数、关闭 2FA 需口令确认、链路回滚。
-动态码由**独立手写的 RFC 6238 实现**生成，等于交叉验证了 `otplib` 的输出。
+| 脚本 | 项数 | 覆盖 |
+|------|------|------|
+| `lab/e2e_panel.py` | 54 | 认证链路、CSRF 拦截、RBAC 越权拦截、上游透传与字段归一化、设备重命名/过期/标签、路由启停与护栏、预授权密钥、审计、设置掩码回显 |
+| `lab/e2e_2fa.py` | 25 | TOTP 生成/校验、两步登录、错误码拒绝、恢复码一次性、关闭 2FA 需口令确认（动态码由**独立手写的 RFC 6238 实现**生成，交叉验证 otplib 输出） |
+| `lab/verify_web.mjs` | 23 | 登录页渲染、登录跳转、控制台真实数据、设备表格数据行、七个页面可达性、移动端无横向溢出、无 JS 运行时错误（Chromium 真实 DOM 断言） |
+| `lab/verify_ws.py` | 18 | WS 握手与订阅、心跳、未认证拒绝（error 帧 + 4401 关闭）、**写操作触发实时推送**（节点/路由） |
 
 复现方式见 [`lab/README.md`](lab/README.md)。
 
 ---
+
+## 开发坑记录
+
+开发中踩到并修复的问题（Fastify 静态资源 / WS 鉴权 / Tailwind 与 antd 共存 / 移动端溢出 / go 模块缓存等），
+见 [`docs/dev-gotchas.md`](docs/dev-gotchas.md)。
 
 ## 目录结构
 
@@ -156,10 +160,20 @@ headscale apikeys create --expiration 90d
 │       ├── crypto/             # AES-256-GCM 密封盒
 │       ├── auth/               # 会话、RBAC 目录、口令/TOTP、路由守卫
 │       ├── headscale/client.ts # Headscale REST 客户端（含实测坑注释）
+│       ├── realtime/hub.ts     # WebSocket 推送中枢 + 状态采样器
 │       ├── services/           # 设置、审计、Headscale 装配与连接自检
 │       └── routes/             # 业务路由
+├── web/                        # React SPA（antd 管组件 + Tailwind 管版面）
+│   └── src/
+│       ├── theme.ts            # antd 设计令牌（与 tailwind brand 色板同源）
+│       ├── api/                # fetch 封装（自动带 CSRF）+ 类型定义
+│       ├── hooks/useRealtime   # WS 客户端（指数退避重连 + 心跳保活）
+│       ├── components/         # 布局、品牌区、共享 UI、角色权限面板
+│       └── pages/              # 控制台/设备/路由/用户/密钥/账户/连接/审计/设置
+├── lab/                        # 联调脚本（对真实 headscale 实例的实测用例）
 └── docs/
-    └── headscale-v0.29-api-notes.md   # 实测 API 笔记（必读）
+    ├── headscale-v0.29-api-notes.md   # 实测 API 笔记（必读）
+    └── dev-gotchas.md                 # 开发坑记录
 ```
 
 ## 许可

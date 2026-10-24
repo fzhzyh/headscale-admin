@@ -28,3 +28,6 @@ tmp/
 .idea/
 .vscode/
 *.swp
+
+# 前端构建产物
+web/dist/
