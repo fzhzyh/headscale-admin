@@ -31,7 +31,8 @@ python3 mk_nodes.py
 | `probe_api.py` | 策略校验强度、节点/用户/API Key 写操作、错误路径、认证失败语义 |
 | `probe_params.py` | 验证「无 body 绑定」端点：body 被忽略、必须走查询参数 |
 | `probe_rename.py` | 验证 RenameNode 改的是 `givenName` 而非 `name` |
-| `e2e_panel.py` | 面板端到端：认证 → CSRF → 透传 → 写操作 → RBAC 越权 → 登出 |
+| `e2e_panel.py` | 面板端到端 54 项：认证 → CSRF → 透传 → 写操作 → RBAC 越权 → 登出 |
+| `e2e_2fa.py` | 2FA 端到端 25 项：TOTP 启用/校验/两步登录/恢复码/关闭（自实现 RFC 6238 交叉验证） |
 
 ## 跑面板端到端
 
