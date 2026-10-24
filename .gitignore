@@ -1,0 +1,30 @@
+# ---- 依赖 / 构建产物 ----
+node_modules/
+dist/
+build/
+*.tsbuildinfo
+
+# ---- 运行时数据（绝不可入库）----
+data/
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+logs/
+*.log
+run/
+tmp/
+
+# ---- 密钥 / 环境 ----
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+!**/tsconfig*.json
+
+# ---- 编辑器 / 系统 ----
+.DS_Store
+.idea/
+.vscode/
+*.swp

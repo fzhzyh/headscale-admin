@@ -1,0 +1,25 @@
+{
+  "name": "headscale-admin",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Headscale v0.29.x Web 管理面板 —— 设备/用户/ACL/路由/DNS/资源/监控/内置 OIDC Provider",
+  "workspaces": [
+    "server",
+    "web"
+  ],
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "dev": "npm run dev --workspace server & npm run dev --workspace web",
+    "dev:server": "npm run dev --workspace server",
+    "dev:web": "npm run dev --workspace web",
+    "build": "npm run build --workspace web && npm run build --workspace server",
+    "build:web": "npm run build --workspace web",
+    "build:server": "npm run build --workspace server",
+    "start": "npm run start --workspace server",
+    "migrate": "npm run migrate --workspace server",
+    "seed": "npm run seed --workspace server",
+    "typecheck": "npm run typecheck --workspace server && npm run typecheck --workspace web"
+  }
+}

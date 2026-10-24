@@ -1,0 +1,62 @@
+# ============================================================
+# headscale-admin 本地联调实例（headscale v0.29.6）
+# 仅供开发验证，端口与线上实例完全隔离
+# ============================================================
+
+server_url: http://127.0.0.1:18080
+
+# REST API /api/v1/* 与 TS2021 都挂在这个口上
+listen_addr: 127.0.0.1:18080
+metrics_listen_addr: 127.0.0.1:19090
+grpc_listen_addr: 127.0.0.1:50443
+grpc_allow_insecure: true
+
+noise:
+  private_key_path: /tmp/hs-lab/lib/noise_private.key
+
+prefixes:
+  v4: 100.64.0.0/10
+  v6: fd7a:115c:a1e0::/48
+
+derp:
+  server:
+    enabled: false
+  # headscale 启动时要求 DERP 地图至少有一个条目，否则直接退出
+  urls:
+    - https://controlplane.tailscale.com/derpmap/default
+  auto_update_enabled: false
+  update_frequency: 24h
+
+disable_check_updates: true
+node_update_check_interval: 10s
+
+# v0.29 新键：node.ephemeral.inactivity_timeout（旧键已废弃）
+node:
+  ephemeral:
+    inactivity_timeout: 30m
+
+database:
+  type: sqlite
+  sqlite:
+    path: /tmp/hs-lab/lib/db.sqlite
+    write_ahead_log: true
+
+log:
+  level: debug
+  format: text
+
+policy:
+  mode: database
+
+dns:
+  magic_dns: true
+  base_domain: hs-lab.local
+  override_local_dns: true
+  nameservers:
+    global:
+      - 1.1.1.1
+  search_domains: []
+  extra_records_path: /tmp/hs-lab/lib/extra-records.json
+
+unix_socket: /tmp/hs-lab/run/headscale.sock
+unix_socket_permission: "0770"
