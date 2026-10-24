@@ -75,7 +75,7 @@ npm run dev:server           # http://127.0.0.1:8080
 
 ```bash
 headscale apikeys create --expiration 90d
-# 输出 hskey-api-xxxxxxxx_yyyyyyyy...，填进 server/.env 的 HS_API_KEY
+# 输出 hskey-api-<prefix>_<secret>...，填进 server/.env 的 HS_API_KEY
 ```
 
 ### 关键环境变量

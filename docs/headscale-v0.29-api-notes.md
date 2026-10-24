@@ -30,7 +30,7 @@ Authorization: Bearer 错  → 401
 ```
 
 API Key 由 `headscale apikeys create` 生成，形如 `hskey-api-<prefix>_<secret>`。
-列表接口只返回 `prefix`（`hskey-api-G31r11_mhD3f-***`），**明文只在创建时返回一次**。
+列表接口只返回 `prefix`（形如 `hskey-api-ab12cd34_ef56-***`），**明文只在创建时返回一次**。
 
 ---
 
