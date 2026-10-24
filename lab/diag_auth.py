@@ -12,7 +12,9 @@ import urllib.request
 import urllib.error
 
 URL = "http://127.0.0.1:18080/api/v1/node"
-K = os.environ.get("HS_API_KEY", "")
+from _local_net import load_hs_key  # noqa: E402
+
+K = load_hs_key()
 
 print("=== 0. 环境 ===")
 print(f"  HS_API_KEY 长度: {len(K)}  首 22 位: {K[:22]}")

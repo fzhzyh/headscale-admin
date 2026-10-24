@@ -6,7 +6,7 @@ import urllib.request
 import urllib.error
 
 BASE = "http://127.0.0.1:18080"
-KEY = "'" + os.environ.get("HS_API_KEY","") + "'"
+KEY = load_hs_key()
 
 
 def call(method, path, payload=None):
@@ -102,7 +102,7 @@ show("list apikey", st, res)
 print("\n" + "=" * 100)
 print("五、认证失败路径")
 print("=" * 100)
-for label, hdr in [("无 Authorization", None), ("错误前缀", "Token abc"), ("无效 key", "Bearer '" + os.environ.get("HS_API_KEY","") + "'")]:
+for label, hdr in [("无 Authorization", None), ("错误前缀", "Token abc"), ("无效 key", "Bearer '" + KEY + "'")]:
     req = urllib.request.Request(f"{BASE}/api/v1/node", method="GET",
                                  headers={"Accept": "application/json"})
     if hdr:

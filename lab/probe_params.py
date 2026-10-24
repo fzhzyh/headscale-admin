@@ -7,7 +7,7 @@ import urllib.error
 import urllib.parse
 
 BASE = "http://127.0.0.1:18080"
-KEY = "'" + os.environ.get("HS_API_KEY","") + "'"
+KEY = load_hs_key()
 
 
 def call(method, path, payload=None):

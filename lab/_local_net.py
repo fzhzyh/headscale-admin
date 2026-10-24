@@ -19,7 +19,13 @@ macOS 上 `urllib.request` 会通过 `getproxies_macosx_sysconf()` **读取系�
     bypass_proxy_for_local()
 """
 import os
+import re
+import pathlib
 import urllib.request
+
+#: headscale API Key 的正确总长度（`hskey-api-` + 13 位前缀 + `_` + 64 位密钥）
+HS_KEY_LEN = 87
+HS_KEY_RE = re.compile(r"^hskey-api-[A-Za-z0-9_-]+$")
 
 
 def bypass_proxy_for_local() -> None:
@@ -45,6 +51,57 @@ def bypass_proxy_for_local() -> None:
         os.environ.pop(var, None)
 
 
+def load_hs_key(env_file: str | pathlib.Path = "server/.env") -> str:
+    """取得 headscale API Key。
+
+    ⚠️ 为什么不能只读环境变量：
+    把密钥**字面写进命令字符串**再执行时，工具链的密钥脱敏层会**间歇性地**
+    多插入一个字符（实测症状：headscale 报
+    `failed to parse ApiKey: length mismatch, expected 64 chars, got 65` → 401）。
+    同一 Key 有时 87 位正常、有时 88 位被拒，表现为「时好时坏」的假故障，
+    极易被误判为「Key 失效」「面板鉴权坏了」「headscale 有 bug」。
+
+    因此：**以文件为准**（`server/.env`，也就是面板自己用的那份），
+    环境变量只在文件不可用时作为回退，且无论来源都要过格式与长度校验。
+
+    参数 `env_file` 相对仓库根目录解析。
+    """
+    candidates: list[tuple[str, str]] = []
+
+    env_val = os.environ.get("HS_API_KEY", "")
+    if env_val:
+        candidates.append(("环境变量 HS_API_KEY", env_val.strip()))
+
+    # 从仓库根或脚本目录向上找 .env
+    here = pathlib.Path(__file__).resolve().parent
+    for base in (here.parent, here, pathlib.Path.cwd()):
+        p = base / env_file
+        if p.is_file():
+            for line in p.read_text(encoding="utf-8").splitlines():
+                if line.strip().startswith("HS_API_KEY="):
+                    candidates.append((str(p), line.split("=", 1)[1].strip()))
+                    break
+            break
+
+    problems: list[str] = []
+    for source, key in candidates:
+        if not HS_KEY_RE.match(key):
+            problems.append(f"{source}: 格式不符（{key[:14]}…）")
+            continue
+        if len(key) != HS_KEY_LEN:
+            problems.append(f"{source}: 长度 {len(key)}，应为 {HS_KEY_LEN}（疑似被篡改）")
+            continue
+        return key
+
+    detail = "\n".join(f"    - {p}" for p in problems) or "    - 未找到任何来源"
+    raise SystemExit(
+        "无法取得有效的 headscale API Key：\n"
+        f"{detail}\n"
+        f"  请把 Key 写入 {env_file}（形如 HS_API_KEY=hskey-api-…，共 {HS_KEY_LEN} 位），\n"
+        "  不要把密钥直接写在命令行里——那会被脱敏层间歇性篡改。"
+    )
+
+
 def assert_local_reachable(url: str, timeout: float = 5.0) -> tuple[bool, str]:
     """自检：确认本地服务真的能直连到（把网络问题与业务问题分开）。"""
     try:
@@ -52,3 +109,4 @@ def assert_local_reachable(url: str, timeout: float = 5.0) -> tuple[bool, str]:
             return True, f"HTTP {r.status}"
     except Exception as e:  # noqa: BLE001 — 自检只关心「通不通」
         return False, str(e)
+

@@ -12,7 +12,7 @@ import urllib.error
 # 本地联调：强制直连，避免 macOS 系统代理把 127.0.0.1 的请求送去代理
 # （曾导致「同一 Key 时而 200 时而 401」的间歇性假故障，详见 _local_net.py）
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _local_net import bypass_proxy_for_local  # noqa: E402
+from _local_net import bypass_proxy_for_local, load_hs_key  # noqa: E402
 
 bypass_proxy_for_local()
 
@@ -135,7 +135,7 @@ check("GET /api/settings 返回 200", st == 200)
 items = {i["key"]: i for i in (res.get("items", []) if isinstance(res, dict) else [])}
 ak = items.get("hs.apiKey", {})
 check("Headscale API Key 只回掩码不回明文", ak.get("configured") is True and "•" in (ak.get("value") or ""), f"value={ak.get('value')}")
-check("掩码不含完整密钥", "'" + os.environ.get("HS_API_KEY","") + "'" not in json.dumps(res))
+check("掩码不含完整密钥", load_hs_key() not in json.dumps(res))
 
 print("\n" + "=" * 100)
 print("5. 写操作（经面板 → headscale）")

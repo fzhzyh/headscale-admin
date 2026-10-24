@@ -92,11 +92,28 @@ headscale 的 `SetTags` 是**单向**操作：一旦给设备打上标签，它�
 | 变量 | 默认 | 说明 |
 |------|------|------|
 | `HS_URL` | `http://127.0.0.1:18080` | headscale 实例地址 |
-| `HS_API_KEY` | 无 | 必须设置 |
+| `HS_API_KEY` | **不需要** | 已改为从 `server/.env` 读取（见下文说明）；环境变量仅作回退 |
 | `PANEL_URL` | `http://127.0.0.1:8080` | 面板地址 |
 | `PANEL_ADMIN_USER` / `PANEL_ADMIN_SECRET` | `admin` / 无 | 面板管理员 |
 | `LAB_VIEWER_PASS` | `ViewerPass2026` | 测试创建的受限账户口令 |
 | `HS_DEBUG_URL` | `http://127.0.0.1:19090` | headscale metrics/debug 端口，用于读 `/debug/filter` |
+
+### ⚠️ 密钥一律从文件读，不要写在命令行里
+
+`server/.env` 是**唯一权威来源**，脚本用 `load_hs_key()` 读取（并强制校验前缀格式与 87 位长度）：
+
+```bash
+# 正确：不传密钥
+PANEL_ADMIN_SECRET=<口令> python3 lab/e2e_acl.py
+
+# 错误：把密钥写进命令行
+HS_API_KEY=hskey-api-... python3 lab/e2e_acl.py     # ← 会被间歇性篡改
+```
+
+原因：把密钥字面写进命令字符串时，工具链的**密钥脱敏层会间歇性多插入一个字符**，
+headscale 随即报 `failed to parse ApiKey: length mismatch, expected 64 chars, got 65` → 401。
+同一 Key 有时 87 位正常、有时 88 位被拒，表现为「时好时坏」的假故障。
+（`load_hs_key()` 会在 Key 不对时**响亮报错并指出疑似原因**，而不是让一串 401 埋掉真相。）
 
 ### ⚠️ 为什么所有脚本都要 `bypass_proxy_for_local()`
 
@@ -123,3 +140,5 @@ python3 -c "import urllib.request; print(urllib.request.getproxies())"
 | `reset_lab.py` | 清理孤儿临时设备、重置策略基线 |
 | `_local_net.py` | **本地直连前置**：禁用代理 + 自检本地服务可达（所有脚本都 import 它） |
 | `diag_auth.py` | 诊断「同一 Key 时而 200 时而 401」的网络原因 |
+| `diag_proxy.py` | 打印代理状态与请求头，对比内联脚本与正式脚本的差异 |
+| `diag_flaky.py` | 连续 60 次调用量化失败率，区分「稳定缺陷」与「间歇故障」 |

@@ -18,12 +18,12 @@ import urllib.error
 # 本地联调：强制直连，避免 macOS 系统代理把 127.0.0.1 的请求送去代理
 # （曾导致「同一 Key 时而 200 时而 401」的间歇性假故障，详见 _local_net.py）
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _local_net import bypass_proxy_for_local  # noqa: E402
+from _local_net import bypass_proxy_for_local, load_hs_key  # noqa: E402
 
 bypass_proxy_for_local()
 
 HS = os.environ.get("HS_URL", "http://127.0.0.1:18080")
-KEY = os.environ.get("HS_API_KEY", "")
+KEY = load_hs_key()
 if not KEY:
     raise SystemExit("需要 HS_API_KEY")
 
