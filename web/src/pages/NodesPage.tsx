@@ -114,7 +114,10 @@ export default function NodesPage(): React.ReactElement {
       await invalidate();
     },
     onError: (e) => {
-      if (e instanceof ApiError && e.code === 'HEADSCALE_TAG_NOT_OWNED') {
+      // 注意：后端在路由内主动拦截时返回的是不带前缀的 `TAG_NOT_OWNED`；
+      // 只有未被捕获、冒泡到全局 errorHandler 的上游错误才是 `HEADSCALE_*` 前缀。
+      // 两种都兼容，避免这个提示框变成永不触发的死代码。
+      if (e instanceof ApiError && (e.code === 'TAG_NOT_OWNED' || e.code === 'HEADSCALE_TAG_NOT_OWNED')) {
         modal.warning({
           title: '标签未被 ACL 授权',
           content: (

@@ -12,7 +12,7 @@ import { nowIso } from '../util/time.ts';
 export interface SettingDef {
   key: string;
   label: string;
-  group: 'headscale' | 'dns' | 'influx' | 'poll' | 'system';
+  group: 'headscale' | 'dns' | 'influx' | 'poll' | 'ai' | 'system';
   /** 敏感值加密存储且不回显 */
   secret?: boolean;
   type: 'string' | 'number' | 'boolean' | 'select';
@@ -101,6 +101,20 @@ export const SETTING_DEFS: SettingDef[] = [
   },
 
   // ---------- 系统 ----------
+  // ---------- AI 辅助生成 ACL ----------
+  // 走 OpenAI 兼容的 /chat/completions，大多数自建与云服务都适配。
+  // 未配置时「AI 辅助生成」会返回 501 与配置指引，不会静默失败。
+  {
+    key: 'ai.baseUrl',
+    label: '模型服务地址',
+    group: 'ai',
+    type: 'string',
+    hint: 'OpenAI 兼容接口的 Base URL，例如 https://api.openai.com/v1 或 http://127.0.0.1:11434/v1',
+    default: '',
+  },
+  { key: 'ai.apiKey', label: 'API Key', group: 'ai', type: 'string', secret: true, hint: '本地模型服务可留空', default: '' },
+  { key: 'ai.model', label: '模型名称', group: 'ai', type: 'string', hint: '例如 gpt-4o-mini、qwen2.5:14b', default: '' },
+
   { key: 'system.lastSyncAt', label: '最后一次全量同步时间', group: 'system', type: 'string', default: '' },
 ];
 

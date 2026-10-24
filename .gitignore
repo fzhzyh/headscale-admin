@@ -23,6 +23,11 @@ tmp/
 *.key
 !**/tsconfig*.json
 
+# ---- Python ----（联调脚本用）
+__pycache__/
+*.py[cod]
+.venv/
+
 # ---- 编辑器 / 系统 ----
 .DS_Store
 .idea/

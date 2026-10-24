@@ -13,6 +13,7 @@ import KeysPage from './pages/KeysPage';
 import PanelUsersPage from './pages/PanelUsersPage';
 import SettingsPage from './pages/SettingsPage';
 import ConnectPage from './pages/ConnectPage';
+import AclPage from './pages/AclPage';
 import AuditPage from './pages/AuditPage';
 import NotFoundPage from './pages/NotFoundPage';
 
@@ -58,6 +59,7 @@ export default function App(): React.ReactElement {
         <Route path="users" element={<UsersPage />} />
         <Route path="keys" element={<KeysPage />} />
         <Route path="panel-users" element={<PanelUsersPage />} />
+        <Route path="acl" element={<AclPage />} />
         <Route path="connect" element={<ConnectPage />} />
         <Route path="audit" element={<AuditPage />} />
         <Route path="settings" element={<SettingsPage />} />

@@ -5,8 +5,16 @@
 """
 import json
 import os
+import sys
 import urllib.request
 import urllib.error
+
+# 本地联调：强制直连，避免 macOS 系统代理把 127.0.0.1 的请求送去代理
+# （曾导致「同一 Key 时而 200 时而 401」的间歇性假故障，详见 _local_net.py）
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _local_net import bypass_proxy_for_local  # noqa: E402
+
+bypass_proxy_for_local()
 
 BASE = os.environ.get("PANEL_URL", "http://127.0.0.1:8080")
 ADMIN_USER = os.environ.get("PANEL_ADMIN_USER", "admin")
@@ -82,12 +90,23 @@ perms = res.get("permissions", []) if isinstance(res, dict) else []
 check("超级管理员拿到全部权限", len(perms) >= 25, f"{len(perms)} 项")
 check("会话信息含用户标识", res.get("user", {}).get("username") == "admin", str(res.get("user")))
 
+# ---- 夹具：动态解析目标节点 ----
+# 不能硬编码 node id：设备被删除重建后 ID 会变，用例会静默失效（踩过）。
+st, _nres, _ = req("GET", "/api/nodes", cookie=cookie)
+_all_nodes = _nres.get("nodes", []) if isinstance(_nres, dict) else []
+_lab = [n for n in _all_nodes if (n.get("user") or {}).get("name") == "labadmin"]
+NODE_ID = next((n["id"] for n in _lab if n.get("displayName") == "lab-alpha"),
+               _lab[0]["id"] if _lab else 1)
+NODE2_ID = next((n["id"] for n in _all_nodes if n["id"] != NODE_ID), NODE_ID)
+print(f"      夹具：目标设备 #{NODE_ID}（另取 #{NODE2_ID} 做互斥参数用例），"
+      f"共 {len(_all_nodes)} 台设备")
+
 print("\n" + "=" * 100)
 print("3. CSRF 防护")
 print("=" * 100)
-st, res, _ = req("POST", "/api/nodes/1/rename", {"newName": "hacked"}, cookie=cookie)
+st, res, _ = req("POST", f"/api/nodes/{NODE_ID}/rename", {"newName": "hacked"}, cookie=cookie)
 check("缺 CSRF Token 的写操作被拦截（403）", st == 403 and res.get("error") == "BAD_CSRF", f"HTTP {st} {res}")
-st, res, _ = req("POST", "/api/nodes/1/rename", {"newName": "hacked"}, cookie=cookie, csrf="wrong-token")
+st, res, _ = req("POST", f"/api/nodes/{NODE_ID}/rename", {"newName": "hacked"}, cookie=cookie, csrf="wrong-token")
 check("错误 CSRF Token 被拦截（403）", st == 403, f"HTTP {st}")
 
 print("\n" + "=" * 100)
@@ -121,34 +140,34 @@ check("掩码不含完整密钥", "'" + os.environ.get("HS_API_KEY","") + "'" no
 print("\n" + "=" * 100)
 print("5. 写操作（经面板 → headscale）")
 print("=" * 100)
-st, res, _ = req("POST", "/api/nodes/1/rename", {"newName": "lab-alpha-v2"}, cookie=cookie, csrf=csrf)
+st, res, _ = req("POST", f"/api/nodes/{NODE_ID}/rename", {"newName": "lab-alpha-v2"}, cookie=cookie, csrf=csrf)
 _gn = (res.get("node") or {}).get("givenName") if isinstance(res, dict) else None
 _dn = (res.get("node") or {}).get("displayName") if isinstance(res, dict) else None
 check("重命名设备成功（写入 givenName，displayName 随之变化）",
       st == 200 and _gn == "lab-alpha-v2" and _dn == "lab-alpha-v2",
       f"HTTP {st} givenName={_gn} displayName={_dn}")
-st, res, _ = req("POST", "/api/nodes/1/rename", {"newName": "lab-alpha"}, cookie=cookie, csrf=csrf)
+st, res, _ = req("POST", f"/api/nodes/{NODE_ID}/rename", {"newName": "lab-alpha"}, cookie=cookie, csrf=csrf)
 check("改回原名", st == 200 and (res.get("node") or {}).get("givenName") == "lab-alpha")
 
-st, res, _ = req("POST", "/api/nodes/1/rename", {"newName": "非法 名字!"}, cookie=cookie, csrf=csrf)
+st, res, _ = req("POST", f"/api/nodes/{NODE_ID}/rename", {"newName": "非法 名字!"}, cookie=cookie, csrf=csrf)
 check("非法设备名被本地校验拦截", st == 400, f"HTTP {st} {res.get('message')}")
 
 # expire 语义验证（最容易踩坑的地方）
-st, res, _ = req("POST", "/api/nodes/3/expire", {"neverExpires": True}, cookie=cookie, csrf=csrf)
+st, res, _ = req("POST", f"/api/nodes/{NODE2_ID}/expire", {"neverExpires": True}, cookie=cookie, csrf=csrf)
 node = res.get("node", {}) if isinstance(res, dict) else {}
 check("『永不过期』生效（expiry=null, neverExpires=true）",
       st == 200 and node.get("expiry") is None and node.get("neverExpires") is True,
       f"HTTP {st} expiry={node.get('expiry')} raw={node.get('expiryRaw')}")
-st, res, _ = req("POST", "/api/nodes/3/expire", {"expiry": "2027-06-01T00:00:00.000Z"}, cookie=cookie, csrf=csrf)
+st, res, _ = req("POST", f"/api/nodes/{NODE2_ID}/expire", {"expiry": "2027-06-01T00:00:00.000Z"}, cookie=cookie, csrf=csrf)
 node = res.get("node", {}) if isinstance(res, dict) else {}
 check("指定到期时间生效（不再退化成立即过期）",
       st == 200 and (node.get("expiry") or "").startswith("2027-06-01"),
       f"expiry={node.get('expiry')}")
-st, res, _ = req("POST", "/api/nodes/3/expire", {"neverExpires": True, "expiry": "2027-06-01T00:00:00.000Z"},
+st, res, _ = req("POST", f"/api/nodes/{NODE2_ID}/expire", {"neverExpires": True, "expiry": "2027-06-01T00:00:00.000Z"},
                  cookie=cookie, csrf=csrf)
 check("互斥参数被拒绝", st == 400, f"HTTP {st} {res.get('message')}")
 
-st, res, _ = req("POST", "/api/nodes/1/delete", {}, cookie=cookie, csrf=csrf)
+st, res, _ = req("POST", f"/api/nodes/{NODE_ID}/delete", {}, cookie=cookie, csrf=csrf)
 check("删除设备缺确认被拒绝", st == 400 and res.get("error") == "NEED_CONFIRM", f"HTTP {st} {res}")
 
 print("\n" + "=" * 100)
@@ -156,20 +175,42 @@ print("6. 路由管理")
 print("=" * 100)
 st, res, _ = req("GET", "/api/routes", cookie=cookie)
 check("GET /api/routes 返回 200", st == 200)
+
+# ---- 夹具：动态定位设备 + 自建已批准路由 ----
+# 两个坑（都踩过）：
+#   1. 不能硬编码 node id —— 设备被删除重建后 ID 会变，用例会静默失效
+#   2. 不能指望 debug/node 的 routes 参数 —— 它只写进「返回的 echo 节点」，
+#      真实节点由 HandleNodeFromAuthPath 从 RegistrationData 创建，而该结构体
+#      根本没有 RoutableIPs 字段，路由在注册时即丢失
+#      （见 hscontrol/grpcv1.go:855 的注释）
+st, res, _ = req("GET", "/api/nodes", cookie=cookie)
+all_nodes = res.get("nodes", []) if isinstance(res, dict) else []
+target = next((n for n in all_nodes if (n.get("user") or {}).get("name") == "labadmin"), None)
+NODE_ID = target["id"] if target else 1
+check("动态找到 labadmin 的设备（不硬编码 id）", target is not None,
+      f"id={NODE_ID} name={(target or {}).get('displayName')}")
+
+st, res, _ = req("PUT", f"/api/routes/node/{NODE_ID}",
+                 {"routes": ["192.168.10.0/24"], "confirmUnadvertised": True},
+                 cookie=cookie, csrf=csrf)
+check("夹具：批准一条路由作为「已批准」基线", st == 200, f"HTTP {st} {str(res)[:90]}")
+
+st, res, _ = req("GET", "/api/routes", cookie=cookie)
 routes = res.get("routes", []) if isinstance(res, dict) else []
 print(f"      路由：{json.dumps(routes, ensure_ascii=False)}")
-check("能读到已批准路由（node1 的 192.168.10.0/24）",
+check("能读到已批准路由（192.168.10.0/24）",
       any(r.get("route") == "192.168.10.0/24" and r.get("approved") for r in routes))
 
-st, res, _ = req("PUT", "/api/routes/node/1", {"routes": ["192.168.10.0/24", "10.99.0.0/16"]},
+st, res, _ = req("PUT", f"/api/routes/node/{NODE_ID}", {"routes": ["192.168.10.0/24", "10.99.0.0/16"]},
                  cookie=cookie, csrf=csrf)
 check("批准未通告路由时给出护栏提示（409）", st == 409 and res.get("error") == "NOT_ADVERTISED",
       f"HTTP {st} {str(res.get('message'))[:90]}")
-st, res, _ = req("PUT", "/api/routes/node/1", {"routes": ["192.168.10.0/24", "10.99.0.0/16"], "confirmUnadvertised": True},
+st, res, _ = req("PUT", f"/api/routes/node/{NODE_ID}",
+                 {"routes": ["192.168.10.0/24", "10.99.0.0/16"], "confirmUnadvertised": True},
                  cookie=cookie, csrf=csrf)
-check("显式确认后可强制批准", st == 200 and "10.99.0.0/16" in (res.get("approvedRoutes") or []), f"HTTP {st} {res}")
+check("显式确认后可强制批准", st == 200 and "10.99.0.0/16" in (res.get("approvedRoutes") or []), f"HTTP {st}")
 
-st, res, _ = req("POST", "/api/routes/toggle", {"nodeId": 1, "route": "10.99.0.0/16", "enable": False},
+st, res, _ = req("POST", "/api/routes/toggle", {"nodeId": NODE_ID, "route": "10.99.0.0/16", "enable": False},
                  cookie=cookie, csrf=csrf)
 check("禁用路由成功", st == 200 and "10.99.0.0/16" not in (res.get("approvedRoutes") or []), f"HTTP {st}")
 
@@ -228,7 +269,7 @@ vcsrf = res.get("csrfToken", "") if isinstance(res, dict) else ""
 if vcookie:
     st, res, _ = req("GET", "/api/nodes", cookie=vcookie)
     check("只读账户可读设备列表", st == 200)
-    st, res, _ = req("POST", "/api/nodes/1/rename", {"newName": "nope"}, cookie=vcookie, csrf=vcsrf)
+    st, res, _ = req("POST", f"/api/nodes/{NODE_ID}/rename", {"newName": "nope"}, cookie=vcookie, csrf=vcsrf)
     check("只读账户改设备被拦截（403 FORBIDDEN）", st == 403 and res.get("error") == "FORBIDDEN",
           f"HTTP {st} {res.get('message')}")
     st, res, _ = req("GET", "/api/settings", cookie=vcookie)

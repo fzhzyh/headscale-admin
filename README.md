@@ -127,20 +127,32 @@ headscale apikeys create --expiration 90d
 |------|------|------|
 | **P1** | 仓库骨架、加密存储、Headscale REST 客户端、认证/RBAC/2FA、审计、设备/用户/密钥/路由/设置 | ✅ 已完成 |
 | **P2** | 实时推送（WebSocket）、前端 SPA（控制台、设备、用户、密钥、路由、账户角色、快速连接、审计、设置） | ✅ 已完成 |
-| **P3** | ACL 引擎：可视化编辑、原始 HuJSON、版本历史、访问检查求值器、AI 辅助 | 待开发 |
+| **P3** | ACL 引擎：可视化编辑、原始 HuJSON、版本历史、访问检查求值器、访问矩阵、AI 辅助 | ✅ 已完成 |
 | **P4** | 监控：状态采样器落 InfluxDB、在线时长、拓扑图、ACL 访问矩阵 | 待开发 |
 | **P5** | 资源中心、DNS 热加载、内置 OIDC Provider、外部 OIDC 登录 | 待开发 |
 
-### 已验证（共 120 项用例，全通过）
+### 已验证（共 356 项用例，全通过）
 
 | 脚本 | 项数 | 覆盖 |
 |------|------|------|
-| `lab/e2e_panel.py` | 54 | 认证链路、CSRF 拦截、RBAC 越权拦截、上游透传与字段归一化、设备重命名/过期/标签、路由启停与护栏、预授权密钥、审计、设置掩码回显 |
+| `lab/e2e_panel.py` | 56 | 认证链路、CSRF 拦截、RBAC 越权拦截、上游透传与字段归一化、设备重命名/过期/标签、路由启停与护栏、预授权密钥、审计、设置掩码回显 |
 | `lab/e2e_2fa.py` | 25 | TOTP 生成/校验、两步登录、错误码拒绝、恢复码一次性、关闭 2FA 需口令确认（动态码由**独立手写的 RFC 6238 实现**生成，交叉验证 otplib 输出） |
 | `lab/verify_web.mjs` | 23 | 登录页渲染、登录跳转、控制台真实数据、设备表格数据行、七个页面可达性、移动端无横向溢出、无 JS 运行时错误（Chromium 真实 DOM 断言） |
+| `server/src/auth/secrets.test.ts` | 39 | 口令哈希与强度、TOTP 密钥/URI/校验、**共享单例污染回归**（先校验动态码再生成密钥，防止 2FA setup 永久 500）、恢复码一次性消费、引导口令生成 |
 | `lab/verify_ws.py` | 18 | WS 握手与订阅、心跳、未认证拒绝（error 帧 + 4401 关闭）、**写操作触发实时推送**（节点/路由） |
+| `lab/e2e_acl.py` | 93 | 策略读写与漂移检测、本地校验拦住 10 类非法策略、**高危护栏**（全通↔全禁必须显式确认，并用 `/debug/filter` 验证上游编译结果真的变了）、**标签不可逆语义**、访问检查 9 类边界、版本历史/差异/回滚、权限拦截。测试**自建自清**一次性设备（因打标签不可逆） |
+| `lab/verify_acl_ui.mjs` | 33 | ACL 页真实 DOM 断言：五个标签页、可视化编辑器四个区块、**非法策略触发错误且两处「应用策略」按钮同步禁用**、访问矩阵格子渲染、访问检查交互求值、版本表格、无运行时错误 |
+| `lab/verify_acl_semantics.py` | 6 | 面板求值结论与上游 `/debug/filter` 编译结果**交叉验证**（含 `{}` vs `{"acls":[]}` 的危险区分） |
+
+另有 `server/src/acl/evaluator.test.ts` 56 项 ACL 求值单元测试。
 
 复现方式见 [`lab/README.md`](lab/README.md)。
+
+**测试夹具约定**（headscale 环境有不可恢复到初始态的部分，踩过坑后固化）：
+- **打标签不可逆** ⇒ 标签用例必须自建自清（`lab/e2e_acl.py` 自带一次性设备）
+- **不硬编码实体 ID** ⇒ 按稳定属性（名字/标签）动态解析，设备重建后 ID 会变
+- **路由不会自动存在** ⇒ `debug/node` 的 `routes` 参数是装饰性的，用例须自备夹具
+- **登录限流 20 次/5 分钟** ⇒ 测试对 429 退避重试，不调松限流
 
 ---
 
@@ -148,6 +160,10 @@ headscale apikeys create --expiration 90d
 
 开发中踩到并修复的问题（Fastify 静态资源 / WS 鉴权 / Tailwind 与 antd 共存 / 移动端溢出 / go 模块缓存等），
 见 [`docs/dev-gotchas.md`](docs/dev-gotchas.md)。
+
+ACL 相关的语义陷阱（`{}` 与 `{"acls":[]}` 语义相反、打标签不可逆、标签设备脱离用户归属、
+`user` 字段在两个接口上不一致等）单独整理在 [`docs/acl-semantics.md`](docs/acl-semantics.md)——
+这些是最容易造成线上事故的地方，改动 ACL 代码前必读。
 
 ## 目录结构
 
@@ -159,20 +175,23 @@ headscale apikeys create --expiration 90d
 │       ├── db/                 # node:sqlite 访问层 + schema + 迁移 + 引导数据
 │       ├── crypto/             # AES-256-GCM 密封盒
 │       ├── auth/               # 会话、RBAC 目录、口令/TOTP、路由守卫
+│       ├── acl/               # ACL 求值引擎（alias 解析 / 模型 / 求值 / 本地校验）
 │       ├── headscale/client.ts # Headscale REST 客户端（含实测坑注释）
 │       ├── realtime/hub.ts     # WebSocket 推送中枢 + 状态采样器
 │       ├── services/           # 设置、审计、Headscale 装配与连接自检
-│       └── routes/             # 业务路由
+│       └── routes/             # 业务路由（含 acl.ts / ai.ts）
 ├── web/                        # React SPA（antd 管组件 + Tailwind 管版面）
 │   └── src/
 │       ├── theme.ts            # antd 设计令牌（与 tailwind brand 色板同源）
 │       ├── api/                # fetch 封装（自动带 CSRF）+ 类型定义
 │       ├── hooks/useRealtime   # WS 客户端（指数退避重连 + 心跳保活）
 │       ├── components/         # 布局、品牌区、共享 UI、角色权限面板
-│       └── pages/              # 控制台/设备/路由/用户/密钥/账户/连接/审计/设置
+│       │   └── acl/            # 可视化编辑器 / 原始编辑 / 版本历史 / 访问检查 / 访问矩阵
+│       └── pages/              # 控制台/设备/ACL/路由/用户/密钥/账户/连接/审计/设置
 ├── lab/                        # 联调脚本（对真实 headscale 实例的实测用例）
 └── docs/
     ├── headscale-v0.29-api-notes.md   # 实测 API 笔记（必读）
+    ├── acl-semantics.md               # ACL 语义与陷阱（含全通/全禁反转、标签不可逆）
     └── dev-gotchas.md                 # 开发坑记录
 ```
 

@@ -38,11 +38,29 @@ export function isNeverExpiring(expiry: string | null | undefined): boolean {
  *     RenameNode 改的是 givenName，name 原封不动。UI 必须优先显示 displayName，
  *     否则「重命名」看起来像没生效。
  */
+/** headscale 的虚拟用户 ID：所有已打标签的设备都归到它名下 */
+const TAGGED_DEVICES_USER_ID = 2147455555;
+const TAGGED_DEVICES_USER_NAME = 'tagged-devices';
+
 function shapeNode(n: HsNode): Record<string, unknown> {
   const neverExpires = isNeverExpiring(n.expiry);
   const expiresAt = neverExpires ? null : new Date(n.expiry!).getTime();
   const now = Date.now();
   const given = (n.givenName ?? '').trim();
+  const tags = n.tags ?? [];
+
+  // ⚠️ headscale 对已打标签设备的 user 字段在**两个接口上不一致**（实测，见
+  // lab/probe_tag_user.py）：
+  //   GET /api/v1/node       → { id: 2147455555, name: "tagged-devices" }
+  //   GET /api/v1/node/{id}  → null
+  // 若只按单节点接口判断，会把「已打标签」误判成「无归属」。这里统一归一化：
+  // 只要有标签就认定归属为 tagged-devices，不依赖接口返回什么。
+  const rawUser = n.user ? { id: Number(n.user.id), name: n.user.name, displayName: n.user.displayName ?? null } : null;
+  const user = rawUser ?? (tags.length > 0 ? { id: TAGGED_DEVICES_USER_ID, name: TAGGED_DEVICES_USER_NAME, displayName: 'Tagged Devices' } : null);
+  const isTagged = tags.length > 0;
+  /** 该设备是否由「用户身份」转为「标签身份」——此转换不可逆，UI 需显式提示 */
+  const taggedIdentity = isTagged;
+
   return {
     id: Number(n.id),
     name: n.name,
@@ -50,9 +68,15 @@ function shapeNode(n: HsNode): Record<string, unknown> {
     /** UI 展示与搜索都用这个：优先 givenName，回退 name */
     displayName: given || n.name,
     renamed: given !== '' && given !== n.name,
-    user: n.user ? { id: Number(n.user.id), name: n.user.name, displayName: n.user.displayName ?? null } : null,
+    user,
+    /**
+     * 标签设备已脱离原用户归属（headscale 的 tags-as-identity 语义）：
+     * user@ 形式的 ACL 规则不会再命中它，只能用 tag: / autogroup:tagged 引用。
+     * 注意 user 字段的 id 是虚拟用户 2147455555，不能拿它去关联真实网络用户。
+     */
+    taggedIdentity,
     ipAddresses: n.ipAddresses ?? [],
-    tags: n.tags ?? [],
+    tags,
     online: Boolean(n.online),
     lastSeen: n.lastSeen ?? null,
     lastSeenAgoSec: secondsSince(n.lastSeen),
@@ -166,6 +190,21 @@ export async function registerNodeRoutes(app: FastifyInstance): Promise<void> {
     // 另外标签必须已在 ACL 的 tagOwners 中定义，否则上游返回 400
     // 「requested tags ... are invalid or not permitted」。
     const before = await hs().getNode(id);
+
+    // ⚠️ 高危护栏：headscale 不允许清空标签（会孤立节点）。
+    // 源码依据 hscontrol/grpcv1.go:326 —— len(tags)==0 直接返回 InvalidArgument。
+    // 本地先拦，给用户可读的说明，而不是把上游的英文错误透传出去。
+    if (parsed.data.tags.length === 0) {
+      return reply.code(400).send({
+        error: 'CANNOT_CLEAR_TAGS',
+        message:
+          'Headscale 不允许清空设备的全部标签（清空会使节点失去归属被孤立）。' +
+          '标签是「用户身份」与「标签身份」二选一，一旦打上标签即无法退回用户归属。',
+        hint: '如需该设备恢复为用户身份，只能删除该设备后重新注册。',
+        currentTags: before.tags ?? [],
+      });
+    }
+
     let node: HsNode;
     try {
       node = await hs().setTags(id, parsed.data.tags);
@@ -188,7 +227,22 @@ export async function registerNodeRoutes(app: FastifyInstance): Promise<void> {
       targetId: id,
       detail: { nodeName: before.name, from: before.tags ?? [], to: parsed.data.tags },
     });
-    return reply.send({ node: shapeNode(node) });
+
+    // 用户身份 → 标签身份 是单向转换（源码注释：Once tagged, a node cannot be
+    // converted back to user-owned），首次打标签时明确告知前端以便弹窗提示。
+    const convertedFromUser = (before.tags ?? []).length === 0 && parsed.data.tags.length > 0;
+    return reply.send({
+      node: shapeNode(node),
+      irreversible: convertedFromUser,
+      ...(convertedFromUser
+        ? {
+            warning:
+              '该设备已从「用户身份」转为「标签身份」，此操作不可逆：' +
+              '设备已脱离原用户归属，按 user@ 编写的 ACL 规则将不再命中它，' +
+              '必须改用 tag: 或 autogroup:tagged 引用。',
+          }
+        : {}),
+    });
   });
 
   // ---------------- 过期 / 取消过期 ----------------

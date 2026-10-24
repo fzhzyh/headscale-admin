@@ -6,6 +6,7 @@
 """
 import json
 import os
+import sys
 import socket
 import ssl
 import base64
@@ -14,6 +15,13 @@ import struct
 import time
 import urllib.request
 import urllib.error
+
+# 本地联调：强制直连，避免 macOS 系统代理把 127.0.0.1 的请求送去代理
+# （曾导致「同一 Key 时而 200 时而 401」的间歇性假故障，详见 _local_net.py）
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _local_net import bypass_proxy_for_local  # noqa: E402
+
+bypass_proxy_for_local()
 
 PANEL = os.environ.get("PANEL_URL", "http://127.0.0.1:8080")
 USER = os.environ.get("PANEL_ADMIN_USER", "admin")
@@ -234,10 +242,24 @@ else:
 print("\n" + "=" * 88)
 print("6. 路由变更推送")
 print("=" * 88)
+# ---- 夹具：确保至少有一条可操作路由 ----
+# 不依赖其它脚本先跑过。理由：debug/node 的 routes 参数是装饰性的
+# （只写进它返回的 echo 节点，真实节点由 RegistrationData 创建，无路由字段），
+# 所以新建的节点天然没有路由，必须显式批准一条。
 st, routes, _ = http("GET", "/api/routes", cookie=cookie)
 rows = routes.get("routes") or []
 if not rows:
-    check("存在可操作路由", False, "无路由")
+    st, nodes, _ = http("GET", "/api/nodes", cookie=cookie)
+    cand = next((n for n in (nodes.get("nodes") or []) if (n.get("user") or {}).get("name") == "labadmin"), None)
+    if cand:
+        http("PUT", f"/api/routes/node/{cand['id']}",
+             {"routes": ["192.168.10.0/24"], "confirmUnadvertised": True}, cookie=cookie, csrf=csrf)
+        st, routes, _ = http("GET", "/api/routes", cookie=cookie)
+        rows = routes.get("routes") or []
+        print(f"  （夹具：已为节点 #{cand['id']} 批准一条路由）")
+
+if not rows:
+    check("存在可操作路由", False, "无路由（且夹具创建失败）")
 else:
     r0 = rows[0]
     while ws.recv(timeout=0.4) is not None:

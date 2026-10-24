@@ -45,19 +45,29 @@ export function totpKeyUri(issuer: string, account: string, secret: string): str
   return authenticator.keyuri(account, issuer, secret);
 }
 
-/** 校验 6 位动态码；窗口放宽 1 个步长以容忍时钟漂移 */
+/**
+ * 校验 6 位动态码；窗口放宽 1 个步长以容忍时钟漂移。
+ *
+ * ⚠️ 踩过的坑：`authenticator` 是**共享单例**，早期写法只恢复 `window` 一个字段：
+ *     const prev = authenticator.options.window;   // 首次调用是 undefined
+ *     finally { authenticator.options = { ...authenticator.options, window: prev } }
+ * 结果把 `window` 永久写成 `undefined`，而 otplib 的校验器要求它是 number，
+ * 于是**此后所有 `generateSecret()` 都抛异常**（表现为 2FA setup 永久 500，
+ * 且只有「先校验过一次动态码」的进程才会复现，极难定位）。
+ * 正确做法：整份快照存取，不做字段级恢复。
+ */
 export function verifyTotp(secret: string, token: string): boolean {
   if (!secret || !token) return false;
   const clean = token.replace(/\s+/g, '');
   if (!/^\d{6}$/.test(clean)) return false;
-  const prevWindow = authenticator.options.window;
+  const snapshot = { ...authenticator.options };
   try {
-    authenticator.options = { ...authenticator.options, window: 1 };
+    authenticator.options = { ...snapshot, window: 1 };
     return authenticator.verify({ token: clean, secret });
   } catch {
     return false;
   } finally {
-    authenticator.options = { ...authenticator.options, window: prevWindow };
+    authenticator.options = snapshot;
   }
 }
 

@@ -29,6 +29,8 @@ import { registerKeyRoutes } from './routes/keys.ts';
 import { registerRouteRoutes } from './routes/routes.ts';
 import { registerSettingsRoutes } from './routes/settings.ts';
 import { registerSystemRoutes } from './routes/system.ts';
+import { registerAclRoutes } from './routes/acl.ts';
+import { registerAiRoutes } from './routes/ai.ts';
 import { registerRealtimeRoutes } from './realtime/hub.ts';
 
 declare module 'fastify' {
@@ -153,6 +155,8 @@ export async function buildApp(): Promise<FastifyInstance> {
   await registerKeyRoutes(app);
   await registerRouteRoutes(app);
   await registerSettingsRoutes(app);
+  await registerAclRoutes(app);
+  await registerAiRoutes(app);
   // WebSocket 实时推送（必须最后注册，避免与静态资源/SPA 回退冲突）
   await registerRealtimeRoutes(app);
 

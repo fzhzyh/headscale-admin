@@ -8,10 +8,20 @@ import hashlib
 import hmac
 import json
 import os
+import sys
+import re
+import time
 import struct
 import time
 import urllib.request
 import urllib.error
+
+# 本地联调：强制直连，避免 macOS 系统代理把 127.0.0.1 的请求送去代理
+# （曾导致「同一 Key 时而 200 时而 401」的间歇性假故障，详见 _local_net.py）
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _local_net import bypass_proxy_for_local  # noqa: E402
+
+bypass_proxy_for_local()
 
 BASE = os.environ.get("PANEL_URL", "http://127.0.0.1:8080")
 ADMIN_USER = os.environ.get("PANEL_ADMIN_USER", "admin")
@@ -41,12 +51,32 @@ def req(method, path, payload=None, cookie=None, csrf=None):
             b = resp.read().decode()
             return resp.status, (json.loads(b) if b.strip().startswith(("{", "[")) else b), resp.headers
     except urllib.error.HTTPError as e:
-        b = e.read().decode()
-        try:
-            parsed = json.loads(b)
-        except Exception:
-            parsed = b
-        return e.code, parsed, e.headers
+        return e.code, _parse(e.read().decode()), e.headers
+
+
+def _parse(b):
+    try:
+        return json.loads(b)
+    except Exception:
+        return b
+
+
+# 登录接口有 20 次/5 分钟的限流（安全设计，必须保留）。整套回归连着跑会触发 429，
+# 那会让后续步骤连锁失败（例如 2FA setup 被打断 → 启用时报 NO_SETUP）。
+# 所以这里对 429 做「按上游提示等待后重试」，而不是把限流调松。
+def req_rl(method, path, payload=None, cookie=None, csrf=None, max_attempts=4):
+    for attempt in range(max_attempts):
+        st, res, hdrs = req(method, path, payload, cookie, csrf)
+        if st != 429:
+            return st, res, hdrs
+        msg = res.get("message", "") if isinstance(res, dict) else str(res)
+        m = re.search(r"retry in (\d+)", msg)
+        wait = int(m.group(1)) * 60 + 5 if m else 30
+        if attempt == max_attempts - 1:
+            return st, res, hdrs
+        print(f"      （触发登录限流，等待 {wait}s 后重试 {attempt + 1}/{max_attempts - 1}）")
+        time.sleep(wait)
+    return st, res, hdrs
 
 
 # ---------------- TOTP (RFC 6238) ----------------
@@ -61,7 +91,7 @@ def totp(secret_b32: str, t: int | None = None, digits: int = 6, period: int = 3
 
 
 def login(user, pwd):
-    return req("POST", "/api/auth/login", {"username": user, "password": pwd})
+    return req_rl("POST", "/api/auth/login", {"username": user, "password": pwd})
 
 
 print("=" * 92)
@@ -81,7 +111,7 @@ check("管理员登录成功（当前未启用 2FA）", st == 200, f"need2fa={re
 print("\n" + "=" * 92)
 print("2. 获取 TOTP 密钥（otplib 运行时验证）")
 print("=" * 92)
-st, res, _ = req("POST", "/api/auth/2fa/setup", {}, cookie=cookie, csrf=csrf)
+st, res, _ = req_rl("POST", "/api/auth/2fa/setup", {}, cookie=cookie, csrf=csrf)
 check("setup 返回 200", st == 200, f"HTTP {st} {res if st != 200 else ''}")
 secret = res.get("secret", "") if isinstance(res, dict) else ""
 uri = res.get("otpauthUrl", "") if isinstance(res, dict) else ""
@@ -94,16 +124,16 @@ check("otpauth 串含 issuer 与账号",
 print("\n" + "=" * 92)
 print("3. 错误动态码必须被拒")
 print("=" * 92)
-st, res, _ = req("POST", "/api/auth/2fa/enable", {"code": "000000"}, cookie=cookie, csrf=csrf)
+st, res, _ = req_rl("POST", "/api/auth/2fa/enable", {"code": "000000"}, cookie=cookie, csrf=csrf)
 check("错误动态码被拒（不泄露密钥）", st == 400 and res.get("error") == "BAD_2FA", f"HTTP {st} {res}")
-st, res, _ = req("POST", "/api/auth/2fa/enable", {"code": "12345"}, cookie=cookie, csrf=csrf)
+st, res, _ = req_rl("POST", "/api/auth/2fa/enable", {"code": "12345"}, cookie=cookie, csrf=csrf)
 check("格式非法的动态码被拒", st == 400, f"HTTP {st}")
 
 print("\n" + "=" * 92)
 print("4. 用真实算法生成动态码并启用 2FA")
 print("=" * 92)
 code = totp(secret)
-st, res, _ = req("POST", "/api/auth/2fa/enable", {"code": code}, cookie=cookie, csrf=csrf)
+st, res, _ = req_rl("POST", "/api/auth/2fa/enable", {"code": code}, cookie=cookie, csrf=csrf)
 check(f"正确动态码 {code} 启用成功（otplib verify 正常）", st == 200 and res.get("ok") is True,
       f"HTTP {st} {res if st != 200 else ''}")
 recovery = res.get("recoveryCodes", []) if isinstance(res, dict) else []

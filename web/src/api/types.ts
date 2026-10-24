@@ -78,6 +78,12 @@ export interface HsNode {
   displayName: string;
   renamed: boolean;
   user: NodeUser | null;
+  /**
+   * 是否已由「用户身份」转为「标签身份」（headscale 的 tags-as-identity 语义）。
+   * 为 true 时该设备已脱离原用户归属：user@ 形式的 ACL 规则不再命中它，
+   * 只能用 tag: / autogroup:tagged 引用。此转换不可逆。
+   */
+  taggedIdentity: boolean;
   ipAddresses: string[];
   tags: string[];
   online: boolean;
@@ -217,4 +223,161 @@ export interface WsMessage {
   changed?: string[];
   data?: unknown;
   message?: string;
+}
+
+// ============================================================
+// ACL 策略（v0.29.6）
+// 注意：`acls` 键「不存在」与「为空数组」语义完全相反 —— 前者全通、后者全禁。
+// 因此类型里所有可选字段都必须允许 undefined，前端绝不能把它们归一化成 []。
+// ============================================================
+
+export type AclAction = 'accept';
+
+export interface AclRule {
+  action: AclAction;
+  proto: string;
+  src: string[];
+  dst: string[];
+}
+
+export interface SshRule {
+  action: 'accept' | 'check' | 'deny';
+  src: string[];
+  dst: string[];
+  users: string[];
+}
+
+export interface NodeAttrGrant {
+  target: string[];
+  attr?: string[];
+  ipPool?: string[];
+}
+
+export interface AutoApprovers {
+  routes?: Record<string, string[]>;
+  exitNode?: string[];
+}
+
+export interface AclPolicy {
+  acls?: AclRule[];
+  grants?: unknown[];
+  ssh?: SshRule[];
+  groups?: Record<string, string[]>;
+  hosts?: Record<string, string>;
+  tagOwners?: Record<string, string[]>;
+  nodeAttrs?: NodeAttrGrant[];
+  autoApprovers?: AutoApprovers;
+  randomizeClientPort?: boolean;
+}
+
+export interface AclValidationIssue {
+  severity: 'error' | 'warning';
+  path: string;
+  message: string;
+  hint?: string;
+}
+
+export interface AclValidationStats {
+  acls: number;
+  grants: number;
+  ssh: number;
+  groups: number;
+  hosts: number;
+  tagOwners: number;
+  nodeAttrs: number;
+  autoApproverRoutes: number;
+  autoApproverExitNodes: number;
+  bytes: number;
+}
+
+export interface AclValidation {
+  ok: boolean;
+  issues: AclValidationIssue[];
+  stats: AclValidationStats;
+}
+
+export interface AclInterpretation {
+  mode: 'allow-all' | 'deny-all' | 'rules';
+  explanation: string;
+  /** 高危模式（全通/全禁），应用前需显式确认 */
+  highImpact: boolean;
+}
+
+export interface AclDrift {
+  drifted: boolean;
+  explanation: string | null;
+  hsUpdatedAt: string | null;
+  lastAppliedVersionId: number | null;
+  lastAppliedAt: string | null;
+}
+
+export interface AclPolicyResponse {
+  content: string;
+  normalized: string | null;
+  parsed: AclPolicy | null;
+  parseError: string | null;
+  hsUpdatedAt: string | null;
+  interpretation: AclInterpretation;
+  validation: AclValidation;
+  drift: AclDrift;
+  canApply: boolean;
+}
+
+export interface AclVersion {
+  id: number;
+  content: string;
+  comment: string | null;
+  source: 'manual' | 'visual-editor' | 'ai' | 'rollback' | 'import';
+  applied: boolean;
+  applyError: string | null;
+  hsUpdatedAt: string | null;
+  createdAt: string;
+  authorName: string | null;
+  summary: AclValidationStats;
+}
+
+export interface AclVersionListResponse {
+  total: number;
+  versions: AclVersion[];
+}
+
+export interface AclDiffLine {
+  type: 'same' | 'add' | 'del';
+  text: string;
+  leftNo: number | null;
+  rightNo: number | null;
+}
+
+export interface AclDiffResponse {
+  from: AclVersion;
+  to: AclVersion;
+  lines: AclDiffLine[];
+}
+
+export type AclCheckSide =
+  | { nodeId: number }
+  | { cidr: string }
+  | { user: string }
+  | { tag: string }
+  | { internet: true };
+
+export interface AclCheckResult {
+  allowed: boolean;
+  reason: string;
+  explanation: string;
+  matched: { rule: string; index: number; side: 'acl' | 'ssh' }[];
+  trace: string[];
+  error?: string | null;
+  source?: string;
+}
+
+export interface AclContext {
+  users: { id: number; name: string; token: string }[];
+  nodes: { id: number; name: string; userName: string | null; ips: string[]; tags: string[]; neverExpires: boolean }[];
+  tags: string[];
+  groups: string[];
+  hosts: string[];
+  routes: string[];
+  autogroups: { src: string[]; dst: string[] };
+  protocols: string[];
 }
