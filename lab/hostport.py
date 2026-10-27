@@ -99,13 +99,40 @@ def serve_once(listener: socket.socket, target: tuple[str, int], label: str) -> 
 
 
 def parse_mapping(spec: str) -> tuple[int, str, int]:
-    """`对外端口=容器IP:容器端口`"""
+    """`对外端口=容器IP:容器端口`
+
+    启动期就把非法映射挡掉。实测踩过：`IP=` 取空（容器已被清理）时，
+    早期实现会绑成 `100.64.0.3:18090 -> :80` 并照样打印"就绪"，
+    直到每个连接进来看日志才发现后端是空的——**错误暴露得太晚**。
+    """
     try:
         left, right = spec.split("=", 1)
-        host, cport = right.rsplit(":", 1)
-        return int(left), host, int(cport)
+        host, cport_s = right.rsplit(":", 1)
+        out_port = int(left)
+        cport = int(cport_s)
     except ValueError as e:
         raise SystemExit(f"映射格式错误：{spec!r}（应为 对外端口=容器IP:容器端口）") from e
+
+    host = host.strip()
+    if not host:
+        raise SystemExit(
+            f"映射 {spec!r} 的目标主机为空。\n"
+            "  常见原因：容器还没起来 / 名字写错 / 取 IP 的命令没拿到值。\n"
+            "  先用 `container list --all` 确认容器在跑并拿到 IP。"
+        )
+    for name, port in (("对外端口", out_port), ("容器端口", cport)):
+        if not (0 < port < 65536):
+            raise SystemExit(f"映射 {spec!r} 的{name}越界：{port}")
+    return out_port, host, cport
+
+
+def probe(host: str, port: int, timeout: float = 1.5) -> bool:
+    """启动时快速探测后端是否可达（仅提示，不阻断——容器可能还在启动）。"""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
 
 
 def main() -> int:
@@ -131,6 +158,10 @@ def main() -> int:
             raise SystemExit(f"无法绑定 {bind_ip}:{out_port} —— {e}") from e
         label = f"{out_port}"
         print(f"  {bind_ip}:{out_port}  →  {chost}:{cport}", flush=True)
+        # 启动时探一下后端：不可达只告警、不阻断（容器可能还在启动），
+        # 但必须让运维**立刻看到**，而不是等第一个请求进来才从日志里翻。
+        if not probe(chost, cport):
+            print(f"    ⚠️ 后端 {chost}:{cport} 当前不可达（容器还没起来？）", flush=True)
         threading.Thread(target=serve_once, args=(srv, (chost, cport), label), daemon=True).start()
         listeners.append(srv)
 
