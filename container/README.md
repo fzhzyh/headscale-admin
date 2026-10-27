@@ -109,8 +109,47 @@ bash 会把全角括号的首字节当成变量名的一部分 → `NET<乱码>:
 ### 8. Apple container 没有 registry 镜像加速器配置
 
 只有 `registry login/logout/list`，没有 mirror 设置。
-本机直连 docker.io 会 `HTTPClientError.connectTimeout`
 ⇒ 把加速器写进镜像引用（如 `docker.m.daocloud.io/library/node:22-alpine`）。
+
+**各源实测结论（本机，2026-10）：**
+
+| 源 | 结果 | 备注 |
+|---|---|---|
+| `docker.io` | ✗ `HTTPClientError.connectTimeout` | `auth.docker.io` 不可达，一律超时 |
+| `docker.m.daocloud.io` | ✓ 可用 | docker.io 唯一可用的加速器 |
+| `ghcr.io` | ✓ 可用（直连） | 慢但稳定，headscale 80MB 约 2m11s |
+| `ghcr.m.daocloud.io` | ✗ `403 missing Bearer challenge` | 与 `docker.1panel.live` 同一错误形态 |
+| `dockerproxy.cn` | ✗ `server closed session with no notification` | |
+| `docker.1panel.live` | ✗ `403 missing Bearer challenge` | 需先 login，无法匿名 |
+
+**注意两条路径的镜像其实是同一个**（digest 一致，可互换）：
+
+    ghcr.io/juanfont/headscale:v0.29.6        digest=cabe84f06999
+    docker.io/headscale/headscale:v0.29.6     digest=cabe84f06999
+
+⇒ ghcr 拉不到时可直接换 docker.io 的官方名（再套 daocloud 加速器）。
+
+### 9. 不指定平台会解包**所有架构**，单个镜像可吃掉 65G
+
+`container image pull` 默认解多架构镜像的**全部平台**。实测日志里就出现过
+`Unpacking image for platform linux/s390x`——本机是 arm64，s390x 那一份纯属浪费。
+
+后果：本机 `~/Library/Application Support/com.apple.container/snapshots`
+累计 **156G**，其中**两个快照各占 65G**（就是 `node:22-alpine` 的全架构解包）。
+
+⇒ 拉取一律限定平台：
+
+    container image pull --platform linux/arm64 <ref>
+    # 或全局：export CONTAINER_DEFAULT_PLATFORM=linux/arm64
+
+`up.sh` 里的 `resolve_hs_image()` 已带 `--platform linux/arm64`。
+
+清理（**会一并删掉其它项目未使用的镜像，先确认再执行**）：
+
+    container image prune          # 只清 dangling
+    container image prune --all    # 清所有未使用镜像
+
+本机根分区 1.9Ti、可用 1.5Ti，此问题不紧急，但会随镜像增多持续膨胀。
 
 ## 目录
 

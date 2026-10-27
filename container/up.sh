@@ -75,17 +75,42 @@ for c in "${HS_CTR}" "${PANEL_CTR}"; do
 done
 
 # ---------------------------------------------------------------- headscale 镜像
+# 目标平台：本机是 arm64；显式指定可避免解包多架构镜像的全部平台。
+# 实测不指定时单个镜像可解出 65G（见 container/README.md 第 9 条）。
+CTR_ARCH="$(uname -m)"
+case "${CTR_ARCH}" in
+  arm64|aarch64) CTR_PLATFORM="linux/arm64" ;;
+  x86_64|amd64)  CTR_PLATFORM="linux/amd64" ;;
+  *)             CTR_PLATFORM="linux/${CTR_ARCH}" ;;
+esac
+
 resolve_hs_image() {
-  if container image list 2>/dev/null | grep -q "juanfont/headscale"; then
-    container image list 2>/dev/null | grep "juanfont/headscale" | awk '{print $1":"$2}' | head -1
-    return
+  local cand found
+  # 1) 本机已有就直接用（优先 juanfont 官方名，两个名字是同一 digest，仅为日志清晰）
+  found="$(container image list 2>/dev/null | awk '/juanfont\/headscale/ {print $1":"$2; exit}')"
+  if [ -z "${found}" ]; then
+    found="$(container image list 2>/dev/null | awk '/headscale\/headscale/ {print $1":"$2; exit}')"
   fi
-  log "本机无 headscale 镜像，尝试拉取 ${HS_IMAGE_DEFAULT}（可能较慢）" >&2
-  if container image pull "${HS_IMAGE_DEFAULT}" >/dev/null 2>&1; then
-    echo "${HS_IMAGE_DEFAULT}"; return
-  fi
-  log "拉取失败，回落到「容器内源码构建」（不触碰宿主机 Go 环境）" >&2
-  container build -f "${CTR_DIR}/Dockerfile.headscale" -t headscale:local "${CTR_DIR}" >&2
+  if [ -n "${found}" ]; then echo "${found}"; return; fi
+
+  # 2) 依次尝试。ghcr.io 直连可用但慢；docker.io 的官方名是**同一个 digest**
+  #    （均 cabe84f06999），ghcr 拉不到时可等价替换。
+  for cand in \
+    "${HS_IMAGE_DEFAULT}" \
+    "docker.io/headscale/headscale:v0.29.6" \
+    "docker.m.daocloud.io/juanfont/headscale:v0.29.6"
+  do
+    log "尝试拉取 ${cand}（--platform ${CTR_PLATFORM}，可能较慢）" >&2
+    if container image pull --platform "${CTR_PLATFORM}" "${cand}" >/dev/null 2>&1; then
+      echo "${cand}"; return
+    fi
+    log "  ✗ ${cand} 失败，换下一个" >&2
+  done
+
+  # 3) 全部失败 → 容器内源码构建（不触碰宿主机 Go 环境）
+  log "所有镜像源均失败，回落到「容器内源码构建」" >&2
+  container build --platform "${CTR_PLATFORM}" \
+    -f "${CTR_DIR}/Dockerfile.headscale" -t headscale:local "${CTR_DIR}" >&2
   echo "headscale:local"
 }
 HS_IMAGE="$(resolve_hs_image)"
