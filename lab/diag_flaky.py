@@ -13,11 +13,12 @@ import urllib.request
 import urllib.error
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _local_net import bypass_proxy_for_local, load_hs_key
+from _local_net import bypass_proxy_for_local, load_hs_key, load_endpoints
 
 bypass_proxy_for_local()
+_EP = load_endpoints()
 
-HS = os.environ.get("HS_URL", "http://127.0.0.1:18080")
+HS = _EP["HS_URL"]
 KEY = load_hs_key()
 POLICY = {"acls": [{"action": "accept", "proto": "tcp", "src": ["*"], "dst": ["*:*"]}]}
 

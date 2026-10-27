@@ -1,0 +1,68 @@
+# Headscale v0.29.6 —— 容器内联调实例配置
+#
+# 与「宿主机裸进程」版本的关键差异：
+#   1. 监听地址一律 0.0.0.0（容器内网关不是 127.0.0.1）
+#   2. 数据落在 /var/lib/headscale，由容器卷持久化
+#   3. server_url 用对外地址 100.64.0.3:18080 —— 这是节点侧要连的地址，
+#      必须是「测试机真能访问到的地址」，写 127.0.0.1 会让远程节点连不上
+#
+# 注意 v0.29 的破坏性变更：
+#   - `ephemeral_node_inactivity_timeout` → `node.ephemeral.inactivity_timeout`
+#   - `randomize_client_port` 已迁到 ACL 策略，写这里会被忽略
+
+server_url: http://100.64.0.3:18080
+listen_addr: 0.0.0.0:8080
+metrics_listen_addr: 0.0.0.0:9090
+grpc_listen_addr: 0.0.0.0:50443
+# 容器内网无 TLS，须显式放行（否则 gRPC 客户端连不上）
+grpc_allow_insecure: true
+
+noise:
+  private_key_path: /var/lib/headscale/noise_private.key
+
+prefixes:
+  v4: 100.64.0.0/10
+  v6: fd7a:115c:a1e0::/48
+
+database:
+  type: sqlite3
+  sqlite:
+    path: /var/lib/headscale/db.sqlite
+
+# DERP 地图不能为空，否则 headscale 启动即 fatal
+derp:
+  server:
+    enabled: false
+  urls:
+    - https://controlplane.tailscale.com/derpmap/default
+  auto_update_enabled: false
+
+# 联调环境不查更新，避免无谓出网
+disable_check_updates: true
+
+node:
+  ephemeral:
+    inactivity_timeout: 30m
+
+# 策略存数据库，面板才能通过 API 读写
+policy:
+  mode: database
+
+dns:
+  magic_dns: true
+  base_domain: lab.internal
+  # v0.29 会在 override_local_dns 为 true 时强制要求 nameservers.global，
+  # 缺了直接 fatal（不是警告）。容器内没有 systemd-resolved，只能显式指定。
+  override_local_dns: true
+  nameservers:
+    global:
+      - 223.5.5.5
+      - 119.29.29.29
+    split: {}
+
+log:
+  level: debug
+  format: text
+
+# 关掉指标之外的无用监听
+unix_socket: /var/run/headscale/headscale.sock

@@ -10,9 +10,46 @@
 import { chromium } from 'playwright';
 import { setTimeout as sleep } from 'node:timers/promises';
 
-const BASE = process.argv[2] ?? 'http://127.0.0.1:8080';
-const USER = process.env.PANEL_ADMIN_USER ?? 'admin';
-const PASS = process.env.PANEL_ADMIN_SECRET ?? '';
+// 地址统一从 container/endpoints.env 取（容器化后服务不在宿主回环上）
+import { readFileSync, existsSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+function loadEndpoints() {
+  const here = dirname(fileURLToPath(import.meta.url));
+  const ep = { PANEL_URL: 'http://100.64.0.3:8080', HS_URL: 'http://100.64.0.3:18080' };
+  for (const base of [join(here, '..'), here, process.cwd()]) {
+    const f = join(base, 'container', 'endpoints.env');
+    if (existsSync(f)) {
+      for (const line of readFileSync(f, 'utf8').split('\n')) {
+        const t = line.trim();
+        if (!t || t.startsWith('#') || !t.includes('=')) continue;
+        const i = t.indexOf('=');
+        ep[t.slice(0, i).trim()] = t.slice(i + 1).trim();
+      }
+      // 同时读 container/lab.env（面板管理员口令等），与 Python 侧 load_endpoints 保持一致
+      const labEnv = join(base, 'container', 'lab.env');
+      if (existsSync(labEnv)) {
+        for (const line of readFileSync(labEnv, 'utf8').split('\n')) {
+          const t = line.trim();
+          if (!t || t.startsWith('#') || !t.includes('=')) continue;
+          const i = t.indexOf('=');
+          const k = t.slice(0, i).trim();
+          if (!(k in ep)) ep[k] = t.slice(i + 1).trim();
+        }
+      }
+      break;
+    }
+  }
+  return ep;
+}
+const EP = loadEndpoints();
+
+
+
+const BASE = process.argv[2] ?? EP.PANEL_URL;
+const USER = process.env.PANEL_ADMIN_USER ?? EP.PANEL_ADMIN_USER ?? 'admin';
+const PASS = process.env.PANEL_ADMIN_SECRET ?? EP.PANEL_ADMIN_SECRET ?? '';
 
 const results = [];
 function check(label, ok, detail = '') {

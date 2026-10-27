@@ -72,9 +72,16 @@ def load_hs_key(env_file: str | pathlib.Path = "server/.env") -> str:
     if env_val:
         candidates.append(("环境变量 HS_API_KEY", env_val.strip()))
 
-    # 从仓库根或脚本目录向上找 .env
     here = pathlib.Path(__file__).resolve().parent
-    for base in (here.parent, here, pathlib.Path.cwd()):
+    repo = here.parent
+
+    # 容器化环境：密钥由 container/up.sh 写入 state/hs-api-key（headscale 重建后仍有效）
+    container_key = repo / "container" / "state" / "hs-api-key"
+    if container_key.is_file():
+        candidates.append((str(container_key), container_key.read_text(encoding="utf-8").strip()))
+
+    # 从仓库根或脚本目录向上找 .env（容器化之前的裸进程环境）
+    for base in (repo, here, pathlib.Path.cwd()):
         p = base / env_file
         if p.is_file():
             for line in p.read_text(encoding="utf-8").splitlines():
@@ -100,6 +107,52 @@ def load_hs_key(env_file: str | pathlib.Path = "server/.env") -> str:
         f"  请把 Key 写入 {env_file}（形如 HS_API_KEY=hskey-api-…，共 {HS_KEY_LEN} 位），\n"
         "  不要把密钥直接写在命令行里——那会被脱敏层间歇性篡改。"
     )
+
+
+def load_endpoints(env_file: str | pathlib.Path = "container/endpoints.env") -> dict[str, str]:
+    """取得联调环境各服务的**对外地址**。
+
+    统一约定：测试一律访问 `100.64.0.3:<port>`，不直接写 127.0.0.1。
+    原因有两个：
+      1. 容器化后服务不再跑在宿主回环上，127.0.0.1 根本连不到
+      2. 对外地址就是真实使用者的访问路径，拿它做测试才能同时验证
+         「发布是否真的通」——只测 127.0.0.1 会漏掉一整类问题
+
+    地址由 `container/up.sh` 写入 `container/endpoints.env`。
+    """
+    defaults = {
+        "PANEL_URL": "http://100.64.0.3:8080",
+        "HS_URL": "http://100.64.0.3:18080",
+        "HS_DEBUG_URL": "http://100.64.0.3:19090",
+    }
+    here = pathlib.Path(__file__).resolve().parent
+    for base in (here.parent, here, pathlib.Path.cwd()):
+        p = base / env_file
+        if p.is_file():
+            for line in p.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                defaults[k.strip()] = v.strip()
+            break
+    # 合并 container/lab.env（面板管理员口令等），省得每个脚本各自解析
+    for base in (here.parent, here, pathlib.Path.cwd()):
+        p = base / "container" / "lab.env"
+        if p.is_file():
+            for line in p.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                defaults.setdefault(k.strip(), v.strip())
+            break
+
+    # 显式环境变量优先级最高（便于临时指向别处）
+    for k in list(defaults):
+        if os.environ.get(k):
+            defaults[k] = os.environ[k]
+    return defaults
 
 
 def assert_local_reachable(url: str, timeout: float = 5.0) -> tuple[bool, str]:

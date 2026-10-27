@@ -22,12 +22,13 @@ import urllib.error
 # 本地联调：强制直连，避免 macOS 系统代理把 127.0.0.1 的请求送去代理
 # （曾导致「同一 Key 时而 200 时而 401」的间歇性假故障，详见 _local_net.py）
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _local_net import bypass_proxy_for_local, load_hs_key  # noqa: E402
+from _local_net import bypass_proxy_for_local, load_hs_key, load_endpoints  # noqa: E402
 
 bypass_proxy_for_local()
+_EP = load_endpoints()
 
-HS = os.environ.get("HS_URL", "http://127.0.0.1:18080")
-DBG = os.environ.get("HS_DEBUG_URL", "http://127.0.0.1:19090")
+HS = _EP["HS_URL"]
+DBG = _EP["HS_DEBUG_URL"]
 KEY = load_hs_key()
 SERVER_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "server")
 
@@ -36,6 +37,26 @@ if not KEY:
     sys.exit(1)
 
 PASSED, FAILED = [], []
+
+
+def debug_available() -> tuple[bool, str]:
+    """探测 /debug/filter 是否可访问。
+
+    容器化后 headscale 的 /debug/* 仅允许本机回环访问，从宿主/容器网络访问一律
+    403「debug access denied」；官方镜像又是 distroless（连 sh 都没有），
+    没法 `container exec` 进去查。此时本脚本的**全部用例**都无法执行，
+    应当整体 SKIP 而不是报一堆看不懂的 403。
+    """
+    try:
+        with urllib.request.urlopen(f"{DBG}/debug/filter", timeout=6) as r:
+            r.read()
+        return True, ""
+    except urllib.error.HTTPError as e:
+        if e.code == 403:
+            return False, "403 debug access denied（debug 端点仅限本机回环）"
+        return False, f"HTTP {e.code}"
+    except Exception as e:  # noqa: BLE001
+        return False, str(e)
 
 
 def check(label, ok, detail=""):
@@ -95,6 +116,17 @@ CASES = [
         "rules",
     ),
 ]
+
+_ok, _why = debug_available()
+if not _ok:
+    print("=" * 88)
+    print("⊘ SKIP 整个交叉验证套件")
+    print(f"  原因：无法访问 {DBG}/debug/filter —— {_why}")
+    print("  说明：容器化后该端点仅限容器内回环访问，而官方镜像是 distroless（无 sh），")
+    print("        无法 exec 进去查。本套件需要在裸进程模式下运行。")
+    print("=" * 88)
+    print("结果：0 通过 / 0 失败（整体 SKIP）")
+    sys.exit(0)
 
 print("=" * 88)
 print("交叉验证：面板判定 vs headscale 编译结果")

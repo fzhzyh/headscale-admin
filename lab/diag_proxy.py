@@ -22,6 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _local_net import bypass_proxy_for_local
 
 bypass_proxy_for_local()
+_EP = load_endpoints()
 
 print("\n=== B. _local_net 处理后 ===")
 print(f"  HS_API_KEY 长度={len(os.environ.get('HS_API_KEY',''))} "
@@ -31,7 +32,7 @@ for v in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "all_proxy",
     print(f"    {v} = {os.environ.get(v)!r}")
 
 print("\n=== C. 用与 e2e_acl.py 完全相同的方式请求 ===")
-HS = os.environ.get("HS_URL", "http://127.0.0.1:18080")
+HS = _EP["HS_URL"]
 HSKEY = os.environ.get("HS_API_KEY", "")
 
 

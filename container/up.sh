@@ -1,0 +1,280 @@
+#!/usr/bin/env bash
+# 拉起容器化的开发/测试环境（Apple container）。
+#
+# 架构：
+#   容器 hs-lab   headscale v0.29.6   :8080 HTTP / :9090 metrics / :50443 gRPC
+#   容器 hs-panel 面板 (Fastify+SPA)   :3000
+#   两者同网络 hs-lab-net，面板按容器名 `hs-lab` 访问 headscale
+#   宿主 lab/hostport.py 把 100.64.0.3:{8080,18080,19090,50443} 转发进容器
+#
+# ⚠️ 为什么要用宿主转发而不是 `container -p`：
+#   实测 Apple container 1.5.0 的端口发布在本机**不可用**——宿主侧确实 LISTEN、
+#   TCP 也能建连，但请求一律 `Connection reset by peer`（默认网络 / 自定义网络 /
+#   绑定指定 IP / 绑定全接口，四种组合全部复现）。而「宿主 → 容器 IP 直连」完全正常。
+#   因此本脚本用一层极简 TCP 转发绕开，对外地址仍是约定的 100.64.0.3。
+#   若哪天 `-p` 修好了，删掉 start_proxy 即可，**测试侧地址不变**。
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CTR_DIR="${ROOT}/container"
+STATE_DIR="${CTR_DIR}/state"
+ENV_FILE="${CTR_DIR}/lab.env"
+
+NET="${HS_NET:-hs-lab-net}"
+NET_SUBNET="${HS_NET_SUBNET:-192.168.80.0/24}"
+HS_CTR="${HS_CONTAINER:-hs-lab}"
+PANEL_CTR="${PANEL_CONTAINER:-hs-panel}"
+HS_IMAGE_DEFAULT="${HS_IMAGE:-ghcr.io/juanfont/headscale:v0.29.6}"
+PANEL_IMAGE="${PANEL_IMAGE:-headscale-admin-panel:dev}"
+PUB_IP="${PUBLIC_IP:-100.64.0.3}"
+
+HS_PUB_PORT=18080
+METRICS_PUB_PORT=19090
+GRPC_PUB_PORT=50443
+PANEL_PUB_PORT=8080
+
+log()  { printf '\033[36m▸\033[0m %s\n' "$*"; }
+ok()   { printf '\033[32m✓\033[0m %s\n' "$*"; }
+warn() { printf '\033[33m!\033[0m %s\n' "$*"; }
+die()  { printf '\033[31m✗\033[0m %s\n' "$*" >&2; exit 1; }
+
+mkdir -p "${STATE_DIR}"
+
+# ---------------------------------------------------------------- 前置检查
+log "检查 Apple container 可用性"
+command -v container >/dev/null || die "未找到 container CLI（Apple container 未安装）"
+container system status 2>&1 | grep -q "running" || {
+  warn "container 系统服务未运行，尝试启动"
+  container system start
+}
+ok "container $(container --version 2>&1 | head -1)"
+
+# 取本机 Tailscale IP，确认对外地址真的是本机
+if command -v tailscale >/dev/null; then
+  TS_IP="$(tailscale ip -4 2>/dev/null | head -1 || true)"
+  if [ -n "${TS_IP}" ] && [ "${TS_IP}" != "${PUB_IP}" ]; then
+    warn "参数 PRIVATE_IP=${PUB_IP} 与本机 Tailscale IP(${TS_IP}) 不一致，请确认"
+  fi
+fi
+
+# ---------------------------------------------------------------- 网络
+if ! container network list 2>/dev/null | awk '{print $1}' | grep -qx "${NET}"; then
+  log "创建网络 ${NET}（${NET_SUBNET}）"
+  container network create "${NET}" --subnet "${NET_SUBNET}" >/dev/null
+else
+  log "复用已有网络 ${NET}"
+fi
+
+# ---------------------------------------------------------------- 清理旧容器
+for c in "${HS_CTR}" "${PANEL_CTR}"; do
+  if container list --all 2>/dev/null | awk '{print $1}' | grep -qx "${c}"; then
+    log "移除同名旧容器 ${c}"
+    container stop "${c}" >/dev/null 2>&1 || true
+    container delete "${c}" >/dev/null 2>&1 || true
+  fi
+done
+
+# ---------------------------------------------------------------- headscale 镜像
+resolve_hs_image() {
+  if container image list 2>/dev/null | grep -q "juanfont/headscale"; then
+    container image list 2>/dev/null | grep "juanfont/headscale" | awk '{print $1":"$2}' | head -1
+    return
+  fi
+  log "本机无 headscale 镜像，尝试拉取 ${HS_IMAGE_DEFAULT}（可能较慢）" >&2
+  if container image pull "${HS_IMAGE_DEFAULT}" >/dev/null 2>&1; then
+    echo "${HS_IMAGE_DEFAULT}"; return
+  fi
+  log "拉取失败，回落到「容器内源码构建」（不触碰宿主机 Go 环境）" >&2
+  container build -f "${CTR_DIR}/Dockerfile.headscale" -t headscale:local "${CTR_DIR}" >&2
+  echo "headscale:local"
+}
+HS_IMAGE="$(resolve_hs_image)"
+ok "headscale 镜像：${HS_IMAGE}"
+
+# ---------------------------------------------------------------- 启动 headscale
+log "启动 headscale 容器 ${HS_CTR}"
+mkdir -p "${STATE_DIR}/hs"
+# ⚠️ 必须显式传 `serve`：官方镜像的 ENTRYPOINT 是 `headscale`，但没有默认 CMD，
+# 不带子命令时它会打印帮助并以 0 退出——容器"成功"启动又立刻停止，
+# 日志里只有一屏 help，极易误判成"启动失败但没报错"。
+container run -d --name "${HS_CTR}" --network "${NET}" \
+  -v "${CTR_DIR}/hs-config.yaml:/etc/headscale/config.yaml:ro" \
+  -v "${STATE_DIR}/hs:/var/lib/headscale" \
+  "${HS_IMAGE}" serve >/dev/null
+
+log "等待 headscale 就绪"
+# 健康检查从**宿主**用 curl 打容器 IP，而不是 `container exec` 进容器用 wget：
+# 官方镜像里没有 wget/curl（实测 `wget: not found`），容器内探活会永远失败，
+# 而实际服务早就起来了——这种"假失败"最浪费时间。
+ctr_ip() { container list --all 2>/dev/null | awk -v n="$1" '$1==n {print $6}' | cut -d/ -f1; }
+wait_http() {
+  local name="$1" port="$2" path="$3" limit="${4:-60}" ip="" code=""
+  for _ in $(seq 1 "$limit"); do
+    ip="$(ctr_ip "$name")"
+    if [ -n "$ip" ]; then
+      code="$(curl -sS --noproxy '*' -m 2 -o /dev/null -w '%{http_code}' "http://${ip}:${port}${path}" 2>/dev/null || echo 000)"
+      [ "$code" = "200" ] && { echo "$ip"; return 0; }
+    fi
+    sleep 2
+  done
+  return 1
+}
+HS_IP="$(wait_http "${HS_CTR}" 8080 /health 60)" || {
+  echo "---- headscale 日志 ----" >&2
+  container logs "${HS_CTR}" 2>&1 | tail -30 >&2
+  die "headscale 未在 120s 内就绪"
+}
+ok "headscale 已就绪（${HS_IP}:8080）"
+
+# ---------------------------------------------------------------- 生成/读取密钥
+if [ ! -f "${ENV_FILE}" ]; then
+  log "首次运行，生成面板密钥到 container/lab.env（已 gitignore）"
+  cat > "${ENV_FILE}" <<EOF
+# 容器化联调环境密钥 —— 由 container/up.sh 生成，不要提交
+PANEL_MASTER_KEY=$(openssl rand -hex 32)
+PANEL_SESSION_SECRET=$(openssl rand -hex 32)
+PANEL_ADMIN_SECRET=$(openssl rand -base64 18 | tr -d '/+=' | head -c 20)
+EOF
+  chmod 600 "${ENV_FILE}"
+fi
+# shellcheck disable=SC1090
+set -a; . "${ENV_FILE}"; set +a
+
+# ---------------------------------------------------------------- 创建 API Key
+# 面板需要一个 headscale API Key 才能读写。每次重建 headscale 都要新建一把，
+# 所以这里**存在 state 里复用**（key 与 headscale 数据库同生命周期）。
+KEY_FILE="${STATE_DIR}/hs-api-key"
+if [ ! -s "${KEY_FILE}" ]; then
+  log "在 headscale 中创建 API Key（有效期 999 天）"
+  container exec "${HS_CTR}" headscale -c /etc/headscale/config.yaml apikeys create --expiration 999d \
+    > "${KEY_FILE}" 2>/dev/null || die "创建 API Key 失败（headscale 未初始化？）"
+  chmod 600 "${KEY_FILE}"
+fi
+HS_API_KEY="$(tr -d '[:space:]' < "${KEY_FILE}")"
+[ -n "${HS_API_KEY}" ] || die "API Key 为空：${KEY_FILE}"
+ok "API Key 就绪（长度 ${#HS_API_KEY}）"
+
+# ---------------------------------------------------------------- 构建并启动面板
+log "构建面板镜像 ${PANEL_IMAGE}（首次较慢）"
+container build -f "${CTR_DIR}/Dockerfile.panel" -t "${PANEL_IMAGE}" "${ROOT}" >/dev/null
+ok "面板镜像构建完成"
+
+log "启动面板容器 ${PANEL_CTR}"
+mkdir -p "${STATE_DIR}/panel"
+# ⚠️ HS_URL 用**容器 IP** 而不是容器名：实测容器名解析返回 IPv6(2001:2::19)
+# 与合成地址(198.18.x.x)，Node 的 fetch 优先 IPv6 → 连接失败；
+# 而直连容器 IP 完全正常。容器 IP 每次重建可能变，下面「同步连接设置」会兜底。
+container run -d --name "${PANEL_CTR}" --network "${NET}" \
+  -v "${STATE_DIR}/panel:/data" \
+  -e PANEL_HOST=0.0.0.0 \
+  -e PANEL_PORT=3000 \
+  -e PANEL_DATA_DIR=/data \
+  -e PANEL_PUBLIC_URL="http://${PUB_IP}:${PANEL_PUB_PORT}" \
+  -e PANEL_MASTER_KEY="${PANEL_MASTER_KEY}" \
+  -e PANEL_SESSION_SECRET="${PANEL_SESSION_SECRET}" \
+  -e PANEL_ADMIN_USER=admin \
+  -e PANEL_ADMIN_SECRET="${PANEL_ADMIN_SECRET}" \
+  -e HS_URL="http://${HS_IP}:8080" \
+  -e HS_GRPC_ADDR="${HS_IP}:50443" \
+  -e HS_API_KEY="${HS_API_KEY}" \
+  -e HS_TRANSPORT=rest \
+  "${PANEL_IMAGE}" >/dev/null
+
+log "等待面板就绪"
+PANEL_IP="$(wait_http "${PANEL_CTR}" 3000 /api/system/health 40)" || {
+  echo "---- 面板日志 ----" >&2
+  container logs "${PANEL_CTR}" 2>&1 | tail -30 >&2
+  die "面板未在 80s 内就绪"
+}
+ok "面板已就绪（${PANEL_IP}:3000）"
+
+# ---------------------------------------------------------------- 同步连接设置
+# 面板把 hs.url / hs.apiKey 存在自己的 SQLite 里，只在**首次**启动时从环境变量播种。
+# 容器重建后 headscale 的 IP 可能变化，不同步就会一直连旧地址 → 全部请求超时。
+# 这里每次启动都对齐一次，保证「重建即可用」。
+log "同步面板的 Headscale 连接设置"
+# 面板把 hs.url / hs.apiKey 存在自己的 SQLite 里，只在**首次**启动时从环境变量播种。
+# 容器重建后 headscale 的 IP 会变，不同步就会一直连旧地址 → 所有业务接口超时。
+#
+# 用 cookie jar 而不是手工拼 Cookie 头：早先手工解析 Set-Cookie 的写法
+# 在实际跑的时候取不到会话，PUT 静默失败，于是面板一直连着旧地址。
+JAR="${STATE_DIR}/cookies.txt"
+rm -f "${JAR}"
+LOGIN_JSON="$(curl -sS --noproxy '*' -m 10 -c "${JAR}" -X POST \
+  -H 'Content-Type: application/json' \
+  -d "{\"username\":\"admin\",\"password\":\"${PANEL_ADMIN_SECRET}\"}" \
+  "http://${PANEL_IP}:3000/api/auth/login" 2>/dev/null || echo '{}')"
+CSRF="$(printf '%s' "${LOGIN_JSON}" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("csrfToken",""))
+except Exception: print("")' 2>/dev/null)"
+
+if [ -n "${CSRF}" ]; then
+  SYNC="$(curl -sS --noproxy '*' -m 12 -b "${JAR}" -X PUT \
+    -H "X-CSRF-Token: ${CSRF}" -H 'Content-Type: application/json' \
+    -d "{\"items\":{\"hs.url\":\"http://${HS_IP}:8080\",\"hs.grpcAddr\":\"${HS_IP}:50443\",\"hs.apiKey\":\"${HS_API_KEY}\"}}" \
+    "http://${PANEL_IP}:3000/api/settings" 2>/dev/null || echo '{}')"
+  case "${SYNC}" in
+    *'"ok":true'*) ok "连接设置已对齐（hs.url=http://${HS_IP}:8080）" ;;
+    *) warn "设置同步返回异常：${SYNC}" ;;
+  esac
+
+  # 用**真正访问 headscale 的**接口验证连通性。
+  # 注意别用 /api/system/overview —— 它只读本地面板库、不碰 headscale，
+  # 用它会得到"连通已确认"的假阳性（这个坑踩过）。
+  NODES="$(curl -sS --noproxy '*' -m 15 -b "${JAR}" \
+    "http://${PANEL_IP}:3000/api/nodes" 2>/dev/null | head -c 200)"
+  case "${NODES}" in
+    *HEADSCALE_TIMEOUT*|*'"error"'*) warn "面板仍无法访问 headscale：${NODES}" ;;
+    *'"nodes"'*) ok "面板 ↔ headscale 连通已确认（/api/nodes 正常）" ;;
+    *) warn "连通性验证返回意外内容：${NODES}" ;;
+  esac
+else
+  warn "无法登录面板以同步设置（管理员口令可能已改），跳过"
+fi
+
+# ---------------------------------------------------------------- 对外发布
+[ -n "${HS_IP}" ] && [ -n "${PANEL_IP}" ] || die "无法取得容器 IP"
+ok "容器 IP：${HS_CTR}=${HS_IP}  ${PANEL_CTR}=${PANEL_IP}"
+
+PID_FILE="${STATE_DIR}/hostport.pid"
+if [ -f "${PID_FILE}" ] && kill -0 "$(cat "${PID_FILE}")" 2>/dev/null; then
+  log "停止旧的转发进程 $(cat "${PID_FILE}")"
+  kill "$(cat "${PID_FILE}")" 2>/dev/null || true
+  sleep 1
+fi
+
+log "启动对外转发（${PUB_IP} → 容器）"
+nohup python3 "${ROOT}/lab/hostport.py" \
+  --bind "${PUB_IP}" \
+  "${PANEL_PUB_PORT}=${PANEL_IP}:3000" \
+  "${HS_PUB_PORT}=${HS_IP}:8080" \
+  "${METRICS_PUB_PORT}=${HS_IP}:9090" \
+  "${GRPC_PUB_PORT}=${HS_IP}:50443" \
+  > "${STATE_DIR}/hostport.log" 2>&1 &
+echo $! > "${PID_FILE}"
+sleep 2
+kill -0 "$(cat "${PID_FILE}")" 2>/dev/null || { cat "${STATE_DIR}/hostport.log"; die "转发进程启动失败"; }
+ok "转发已启动（pid $(cat "${PID_FILE}")）"
+
+# 回写到 lab/ 下的地址文件，测试脚本据此取地址
+cat > "${CTR_DIR}/endpoints.env" <<EOF
+# 由 container/up.sh 生成：测试统一从这里取对外地址
+PANEL_URL=http://${PUB_IP}:${PANEL_PUB_PORT}
+HS_URL=http://${PUB_IP}:${HS_PUB_PORT}
+HS_DEBUG_URL=http://${PUB_IP}:${METRICS_PUB_PORT}
+HS_CONTAINER=${HS_CTR}
+PANEL_CONTAINER=${PANEL_CTR}
+HS_CONTAINER_IP=${HS_IP}
+PANEL_CONTAINER_IP=${PANEL_IP}
+EOF
+
+echo
+echo "────────────────────────────────────────────────────────"
+ok "容器化联调环境已就绪"
+echo "  面板        http://${PUB_IP}:${PANEL_PUB_PORT}"
+echo "  headscale   http://${PUB_IP}:${HS_PUB_PORT}"
+echo "  指标        http://${PUB_IP}:${METRICS_PUB_PORT}"
+echo "  管理员      admin / ${PANEL_ADMIN_SECRET}"
+echo "  （密钥见 container/lab.env，地址见 container/endpoints.env）"
+echo "────────────────────────────────────────────────────────"
+echo "  停止：container/down.sh"

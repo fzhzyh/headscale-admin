@@ -5,8 +5,26 @@
  * 环境变量只负责引导，运行期以数据库为准，这样面板可以自运维 Headscale 连接。
  */
 import { existsSync, mkdirSync, readFileSync, writeFileSync, chmodSync } from 'node:fs';
-import { resolve, join } from 'node:path';
+import { resolve, join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { randomBytes } from 'node:crypto';
+
+/**
+ * 本模块所在目录（编译前后都能用）。
+ *
+ * ⚠️ 为什么默认路径不能基于 `process.cwd()`：
+ * 容器里 WORKDIR=/app、入口是 `node server/dist/index.js`，
+ * `resolve('../web/dist')` 会算成 /web/dist（少了 /app 前缀），
+ * 于是面板首页 404、提示「前端资源未构建」——而文件其实好好的在 /app/web/dist。
+ * 本地之所以没暴露，是因为 npm workspace 会把 cwd 设成 server/，恰好算对。
+ *
+ * 改为相对「模块自身位置」解析，本地 / 容器 / 任意启动目录都正确。
+ *
+ * 注：本注释里不要写连续的双星号加斜杠——那会提前闭合块注释。
+ */
+const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
+/** 从 server/{src,dist}/ 回到仓库根，再进 web/dist */
+const DEFAULT_WEB_DIST = resolve(MODULE_DIR, '..', '..', 'web', 'dist');
 
 function env(key: string, fallback = ''): string {
   const v = process.env[key];
@@ -150,7 +168,8 @@ export function loadConfig(): AppConfig {
       cookieSecure: publicUrl.startsWith('https://'),
     },
 
-    webDist: resolve(env('WEB_DIST', '../web/dist')),
+    // 默认相对模块位置（见文件头说明）；WEB_DIST 仍可显式覆盖
+    webDist: env('WEB_DIST') ? resolve(env('WEB_DIST')) : DEFAULT_WEB_DIST,
   };
 
   return cached;

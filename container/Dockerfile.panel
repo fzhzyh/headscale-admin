@@ -1,0 +1,56 @@
+# 面板镜像：单容器跑 Fastify + 已构建的 SPA
+#
+# 设计取舍：
+#   - **一体化镜像**（API + 静态资源同一个进程）：面板本身是单进程应用，
+#     拆成 nginx + api 两个容器只会增加联调复杂度，收益为零
+#   - **多阶段构建**：构建依赖（tsc / vite / @types）不进运行镜像，体积小很多
+#   - **国内加速器**：本机直连 docker.io 超时（实测 `HTTPClientError.connectTimeout`），
+#     镜像源用 daocloud；Apple container 没有 registry-mirror 配置，
+#     只能把加速器写进 FROM 的完整引用里
+#   - 端口用 3000 而不是 8080：容器内 headscale 占 8080，避免混淆
+
+# ---------- 构建阶段 ----------
+FROM docker.m.daocloud.io/library/node:22-alpine AS build
+WORKDIR /app
+
+# 先只拷依赖清单，让依赖层可缓存（改源码不会重装依赖）
+COPY package.json package-lock.json .npmrc ./
+COPY server/package.json server/package.json
+COPY web/package.json web/package.json
+RUN npm ci --no-audit --no-fund
+
+# 再拷源码构建（web 先构建，server 的静态资源托管依赖 web/dist）
+COPY tsconfig.base.json ./
+COPY server/ server/
+COPY web/ web/
+RUN npm run build
+
+# ---------- 运行阶段 ----------
+FROM docker.m.daocloud.io/library/node:22-alpine AS runtime
+WORKDIR /app
+ENV NODE_ENV=production \
+    PANEL_HOST=0.0.0.0 \
+    PANEL_PORT=3000 \
+    PANEL_DATA_DIR=/data
+
+# 只带运行期需要的东西
+#
+# ⚠️ 不要 COPY server/node_modules：npm workspaces 会把依赖**全部提升到根
+# node_modules**，子包目录下通常根本没有 node_modules，COPY 会直接报
+# "failed to compute cache key: /app/server/node_modules: not found"。
+# Node 的模块解析会从 /app/server/dist 逐级向上找到 /app/node_modules，足够。
+COPY --from=build /app/node_modules ./node_modules
+COPY --from=build /app/server/dist ./server/dist
+COPY --from=build /app/server/package.json ./server/package.json
+COPY --from=build /app/web/dist ./web/dist
+COPY package.json ./
+
+# 数据卷：# 面板的 SQLite + 加密密钥都落在这里，必须持久化
+VOLUME ["/data"]
+
+EXPOSE 3000
+# 健康检查用面板自己的健康端点（它同时校验 DB 可达）
+HEALTHCHECK --interval=15s --timeout=5s --start-period=20s --retries=5 \
+  CMD node -e "fetch('http://127.0.0.1:3000/api/system/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+
+CMD ["node", "server/dist/index.js"]

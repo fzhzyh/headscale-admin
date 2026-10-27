@@ -11,7 +11,7 @@ import subprocess
 import urllib.request
 import urllib.error
 
-URL = "http://127.0.0.1:18080/api/v1/node"
+URL = load_endpoints()["HS_URL"]
 from _local_net import load_hs_key  # noqa: E402
 
 K = load_hs_key()

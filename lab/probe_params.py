@@ -6,7 +6,7 @@ import urllib.request
 import urllib.error
 import urllib.parse
 
-BASE = "http://127.0.0.1:18080"
+BASE = load_endpoints()["HS_URL"]
 KEY = load_hs_key()
 
 

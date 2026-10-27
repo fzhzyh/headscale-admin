@@ -1,0 +1,50 @@
+# 构建上下文排除项 —— 既为了体积/速度，更是为了**不把本机敏感数据打进镜像**
+#
+# 最关键的三条：
+#   .env          宿主机的面板密钥（PANEL_MASTER_KEY / HS_API_KEY …）
+#   data/         面板真实 SQLite（含账号、会话、审计）
+#   container/    联调环境的状态目录（headscale 库、API Key、生成的密钥）
+#
+# 曾经差点踩到：`COPY server/ server/` 会把这些一并拷进构建上下文。
+
+# 依赖与构建产物
+node_modules
+**/node_modules
+dist
+**/dist
+build
+**/build
+*.tsbuildinfo
+
+# 密钥与运行时数据
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+**/!.env.example
+data
+**/data
+*.sqlite
+*.sqlite-*
+logs
+**/logs
+*.log
+
+# 联调环境状态（headscale 数据库 / API Key / 生成的口令）
+container/state
+container/lab.env
+container/endpoints.env
+
+# 版本控制与文档（构建不需要）
+.git
+.gitignore
+docs
+lab
+
+# 系统与编辑器
+.DS_Store
+.idea
+.vscode
+**/__pycache__
+*.pyc

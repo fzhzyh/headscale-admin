@@ -36,3 +36,8 @@ __pycache__/
 
 # 前端构建产物
 web/dist/
+
+# ---- 容器化联调环境（运行期状态与密钥，绝不可入库）----
+container/state/
+container/lab.env
+container/endpoints.env

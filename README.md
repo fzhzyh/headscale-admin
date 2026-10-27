@@ -54,28 +54,55 @@ headscale 本身做不到的事，本面板不会假装能做：
 
 ---
 
-## 快速开始
+## 快速开始（容器化，推荐）
+
+联调/测试环境统一跑在 **Apple container** 里，对外访问一律用 **`100.64.0.3`**（本机 Tailscale IP）。
+
+```bash
+container/up.sh        # 拉起 headscale + 面板（首次会构建镜像，约 3~5 分钟）
+container/down.sh      # 停止（保留数据）
+container/down.sh --purge   # 停止并清空
+```
+
+起来之后：
+
+```
+面板        http://100.64.0.3:8080
+headscale   http://100.64.0.3:18080
+指标        http://100.64.0.3:19090
+```
+
+管理员口令见 `container/lab.env`（自动生成，已 gitignore）。
+首次起来的 headscale 是空网，跑测试前先播种夹具：
+
+```bash
+python3 lab/seed_lab.py --routes     # 2 个用户 + 4 台设备 + 1 条已批准路由
+```
+
+详见 [`container/README.md`](container/README.md)（含 13 条容器化实测坑）。
+
+### 为什么不用 `container -p` 发布端口
+
+实测 Apple container 1.5.0 的端口发布在本机**不可用**：宿主侧确实 LISTEN、
+TCP 也能建连，但请求一律 `Connection reset by peer`；
+而「宿主 → 容器 IP 直连」完全正常。
+因此用 `lab/hostport.py` 做一层透明 TCP 转发，对外地址仍是约定的 `100.64.0.3`。
+若上游修好了，删掉转发层即可，**测试侧地址不变**。
+
+## 本地裸进程方式（备选，无容器时）
 
 ```bash
 # 1. 安装依赖
-npm install
+npm ci
 
 # 2. 准备配置
-cp .env.example server/.env
-$EDITOR server/.env          # 至少填 PANEL_ADMIN_SECRET 与 HS_API_KEY
+cp .env.example server/.env   # 填 HS_URL / HS_API_KEY / PANEL_ADMIN_SECRET
 
 # 3. 初始化数据库（含内置角色 + 初始管理员）
-npm run migrate
+npm run migrate && npm run seed
 
 # 4. 启动（生产用 npm run build && npm start）
-npm run dev:server           # http://127.0.0.1:8080
-```
-
-获取 Headscale API Key：
-
-```bash
-headscale apikeys create --expiration 90d
-# 输出 hskey-api-<prefix>_<secret>...，填进 server/.env 的 HS_API_KEY
+npm run dev
 ```
 
 ### 关键环境变量

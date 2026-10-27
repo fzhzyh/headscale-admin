@@ -1,0 +1,45 @@
+# Headscale v0.29.6 —— 容器内源码构建（官方镜像不可用时的路径）
+#
+# 为什么保留这条路径：
+#   1. 官方镜像在 ghcr.io，本机拉取不稳；源码构建只依赖 Go proxy，链路更短
+#   2. **顺带解决一个宿主机顽疾**：本机 `~/go/pkg/mod` 有 193 个 root 所有的
+#      路径（598MB），任何宿主机上的 Go 构建都会报 permission denied。
+#      在容器里构建 = 用容器自己的 GOMODCACHE，**完全不碰宿主机环境**
+#
+# 用官方镜像更省事时，up.sh 会自动优先用它；拉不到才回落到这里。
+
+# ---------------------------------------------------------------- 构建阶段
+# Go 版本必须匹配 headscale 的 go.mod 要求：v0.29.6 声明 `go 1.27.3`，
+# 用更低版本会直接构建失败（不是警告）。
+FROM docker.m.daocloud.io/library/golang:1.27-alpine AS build
+
+# 国内 proxy，且关掉 sumdb（本机网络直连 sum.golang.org 不稳）
+ENV GOPROXY=https://goproxy.cn,direct \
+    GOSUMDB=off \
+    CGO_ENABLED=0
+
+RUN apk add --no-cache git ca-certificates
+
+WORKDIR /src
+ARG HEADSCALE_VERSION=v0.29.6
+RUN git clone --depth 1 --branch ${HEADSCALE_VERSION} \
+      https://github.com/juanfont/headscale.git . \
+    && go build -trimpath -ldflags "-s -w" -o /out/headscale ./cmd/headscale
+
+FROM docker.m.daocloud.io/library/alpine:3.20 AS runtime
+
+RUN apk add --no-cache ca-certificates tzdata \
+    && mkdir -p /var/lib/headscale /var/run/headscale /etc/headscale
+
+COPY --from=build /out/headscale /usr/local/bin/headscale
+
+# 数据（SQLite + noise key）与运行时 socket 都在这两个目录，需要持久化
+VOLUME ["/var/lib/headscale"]
+
+EXPOSE 8080 9090 50443
+
+# 健康检查用 headscale 自己的 /health（无需 API Key）
+HEALTHCHECK --interval=10s --timeout=3s --start-period=15s --retries=6 \
+  CMD wget -qO- http://127.0.0.1:8080/health || exit 1
+
+ENTRYPOINT ["headscale", "serve", "-c", "/etc/headscale/config.yaml"]

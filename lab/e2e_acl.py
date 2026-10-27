@@ -29,15 +29,16 @@ import urllib.error
 # 本地联调：强制直连，避免 macOS 系统代理把 127.0.0.1 的请求送去代理
 # （曾导致「同一 Key 时而 200 时而 401」的间歇性假故障，详见 _local_net.py）
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _local_net import bypass_proxy_for_local, load_hs_key  # noqa: E402
+from _local_net import bypass_proxy_for_local, load_hs_key, load_endpoints  # noqa: E402
 
 bypass_proxy_for_local()
+_EP = load_endpoints()
 
-BASE = os.environ.get("PANEL_URL", "http://127.0.0.1:8080")
-HS = os.environ.get("HS_URL", "http://127.0.0.1:18080")
-DBG = os.environ.get("HS_DEBUG_URL", "http://127.0.0.1:19090")
-USER = os.environ.get("PANEL_ADMIN_USER", "admin")
-PASS = os.environ.get("PANEL_ADMIN_SECRET", "")
+BASE = _EP["PANEL_URL"]
+HS = _EP["HS_URL"]
+DBG = _EP["HS_DEBUG_URL"]
+USER = _EP.get("PANEL_ADMIN_USER", "admin")
+PASS = _EP.get("PANEL_ADMIN_SECRET", "")
 HSKEY = load_hs_key()
 
 PASSED, FAILED = [], []
@@ -116,11 +117,27 @@ def hs_set_policy(policy_obj):
 
 
 def hs_filter():
+    """读取 headscale 编译后的 filter。
+
+    返回：
+      - list / None  正常结果（None 表示全禁）
+      - "__DENIED__" debug 端点拒绝访问
+      - "__ERR__"    其它错误
+    """
     try:
         with urllib.request.urlopen(f"{DBG}/debug/filter", timeout=10) as r:
             return json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        return "__DENIED__" if e.code == 403 else "__ERR__"
     except Exception:
         return "__ERR__"
+
+
+# 容器化后 headscale 只监听在容器内，/debug/* 仅限本机回环访问，
+# 从宿主/容器网络访问一律 403「debug access denied」；而官方镜像是 distroless
+# （连 sh 都没有），无法 `container exec` 进去查。
+# 这两项是「与上游编译结果交叉验证」，不是产品功能，因此容器模式下显式跳过。
+DEBUG_UNAVAILABLE = False
 
 
 print("=" * 92)
@@ -347,13 +364,20 @@ if st == 200:
     check("返回新模式为 deny-all", res.get("mode") == "deny-all", str(res.get("mode")))
 
 filt = hs_filter()
-check("headscale 编译结果确为全禁（filter=null）", filt is None, f"filter={str(filt)[:60]}")
+if filt == "__DENIED__":
+    DEBUG_UNAVAILABLE = True
+    print("  ⊘ SKIP headscale 编译结果确为全禁 —— /debug/filter 仅限本机回环，容器化后不可达")
+else:
+    check("headscale 编译结果确为全禁（filter=null）", filt is None, f"filter={str(filt)[:60]}")
 
 st, res, _ = req("PUT", "/api/acl/policy", {"content": '{}', "acknowledgedImpact": True}, cookie=cookie, csrf=csrf)
 check("切到全通（带确认）", st == 200, f"HTTP {st}")
 filt = hs_filter()
-is_allow_all = isinstance(filt, list) and len(filt) == 1 and filt[0].get("SrcIPs") == ["*"]
-check("headscale 编译结果确为全通", is_allow_all, f"filter={str(filt)[:60]}")
+if filt == "__DENIED__":
+    print("  ⊘ SKIP headscale 编译结果确为全通 —— /debug/filter 仅限本机回环，容器化后不可达")
+else:
+    is_allow_all = isinstance(filt, list) and len(filt) == 1 and filt[0].get("SrcIPs") == ["*"]
+    check("headscale 编译结果确为全通", is_allow_all, f"filter={str(filt)[:60]}")
 
 st, res, _ = req("PUT", "/api/acl/policy",
                  {"content": '{"acls":[{"action":"accept","proto":"tcp","src":["*"],"dst":["*:*"]}]}',
@@ -501,7 +525,7 @@ if TMP_ID:
     check("headscale 侧确认已删除", st != 200, f"HTTP {st}")
 
 print(f"\n{'=' * 92}")
-print(f"结果：{len(PASSED)} 通过 / {len(FAILED)} 失败")
+print(f"结果：{len(PASSED)} 通过 / {len(FAILED)} 失败" + ("（含 2 项 SKIP：/debug/filter 容器内不可达）" if DEBUG_UNAVAILABLE else ""))
 if FAILED:
     print("失败项：")
     for f in FAILED:
