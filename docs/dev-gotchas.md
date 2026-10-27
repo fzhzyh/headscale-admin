@@ -358,3 +358,46 @@ KEY = load_hs_key()        # 优先 server/.env，并强制校验前缀格式与
 **推广**：排查「同一凭证时好时坏」时，去**服务端日志**找答案——它记录的是
 **实际收到的东西**，比在客户端猜一万次都有效。另外，**不要把密钥写在命令行里**：
 既会被篡改，也违反最小暴露原则。
+
+---
+
+## 21. recharts 的 `AreaChart` 会**静默忽略** `<Line>`
+
+想在面积图上叠一条折线（例如「在线设备数」面积 + 「在线率」折线）时，
+如果父容器写 `AreaChart`，混进去的 `<Line>` **不报错、不警告，直接不渲染**——
+图上少一条线、图例少一项，控制台干干净净。
+
+```tsx
+// ✗ 错：Line 被静默丢弃
+<AreaChart data={rows}>
+  <Area dataKey="online" />
+  <Line dataKey="ratioPct" />   {/* 完全不生效 */}
+</AreaChart>
+
+// ✓ 对：Area + Line 混合必须用 ComposedChart
+<ComposedChart data={rows}>
+  <Area dataKey="online" />
+  <Line dataKey="ratioPct" />
+</ComposedChart>
+```
+
+**发现方式**：图例断言「含在线率」失败 → 打印 `.recharts-line` 数量为 **0** 才定位到。
+仅靠「图渲染出来了」的断言发现不了——面积图是画出来了的。
+
+⇒ 断言图表时不要只数 `.recharts-surface`（图例图标也是 svg，会虚增数量），
+要**按图层类型分别数**：`.recharts-area-area`、`.recharts-line-curve`、
+`.recharts-legend-item-text`。
+
+## 22. Flux `pivot()` 之后没有 `_value` 列
+
+自己解析 InfluxDB 的 annotated CSV 时，容易写「只保留有 `_value` 的数据行」。
+但 `pivot(rowKey, columnKey, valueColumn)` 会把每个 field **拆成独立列**，
+此时根本不存在 `_value` → 整张表被过滤成空。
+
+现象很坑：InfluxDB 里 `count()` 明明有 9 条，接口却返回 `points: []`，
+且**不报任何错**（HTTP 200、`degraded: false`）。
+
+⇒ 解析器要按表头判断：`hasValueCol = header.includes('_value')`，
+只有为真时才按 `_value` 过滤。已写回归用例锁住
+（`server/src/timeseries/influx.test.ts` 第 2 节）。
+

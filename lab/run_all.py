@@ -77,6 +77,7 @@ def suites() -> list[Suite]:
         Suite("上游语义交叉验证", "python", "verify_acl_semantics.py", allow_skip=True),
         # —— 前端 DOM 断言 ——
         Suite("P2 前端", "node", "verify_web.mjs"),
+        Suite("P4 统计前端", "node", "verify_stats_ui.mjs"),
         Suite("P3 ACL 前端", "node", "verify_acl_ui.mjs"),
     ]
 

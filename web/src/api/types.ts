@@ -381,3 +381,108 @@ export interface AclContext {
   autogroups: { src: string[]; dst: string[] };
   protocols: string[];
 }
+
+// ============================================================
+// 监控统计（P4，数据来自 InfluxDB 时序库）
+//
+// ⚠️ 注意**没有流量相关类型**，这是刻意的：
+// headscale 是控制面，数据面 WireGuard 流量不经过它，其 /metrics 与节点对象
+// 均无流量字段。后端 /api/stats/traffic 明确返回 501，前端因此也不做流量图。
+// ============================================================
+
+/** /api/stats/health —— 时序库与采样器自检 */
+export interface StatsHealth {
+  ok: boolean;
+  influx: { enabled: boolean; detail: string };
+  sampler: {
+    enabled: boolean;
+    trackedNodes: number;
+    recordedRounds: number;
+    skippedRounds: number;
+  };
+  writer: {
+    written: number;
+    dropped: number;
+    buffered: number;
+    lastError: string | null;
+    lastErrorAgoSec: number | null;
+  };
+  capabilities: {
+    onlineStatus: boolean;
+    onlineDuration: boolean;
+    topology: boolean;
+    aclMatrix: boolean;
+    /** 恒为 false：当前架构下设备流量不可得 */
+    deviceTraffic: boolean;
+  };
+  notes: { deviceTraffic: string };
+}
+
+/** 集群曲线上的一个点（一次采样） */
+export interface ClusterPoint {
+  t: string;
+  nodesTotal: number | null;
+  nodesOnline: number | null;
+  nodesOffline: number | null;
+  onlineRatio: number | null;
+  routesAvailable: number | null;
+  routesApproved: number | null;
+}
+
+export interface ClusterSeries {
+  degraded: boolean;
+  error?: string;
+  hours: number;
+  points: ClusterPoint[];
+}
+
+/** 单节点曲线上的一个点 */
+export interface NodeSeriesPoint {
+  t: string;
+  online: boolean;
+  onlineStreakSec: number | null;
+  lastSeenAgeSec: number | null;
+  routesAvailable: number | null;
+  routesApproved: number | null;
+}
+
+/**
+ * 在线时长统计。
+ * gapSec 是**采样空洞**（面板重启/上游中断）——如实暴露，不做平滑。
+ * onlineRatio 只按「实际覆盖到的区间」计算，不对空洞做假设。
+ */
+export interface NodeUptime {
+  onlineSec: number;
+  coveredSec: number;
+  gapSec: number;
+  sampleCount: number;
+  onlineRatio: number | null;
+}
+
+export interface NodeSeries {
+  degraded: boolean;
+  error?: string;
+  nodeId: number;
+  hours: number;
+  name: string | null;
+  points: NodeSeriesPoint[];
+  uptime?: NodeUptime;
+}
+
+/** /api/stats/overview —— 全节点 24h 聚合 */
+export interface StatsOverviewNode {
+  nodeId: number;
+  name: string;
+  lastOnline: boolean;
+  sampleRatio: number | null;
+  sampleCount: number;
+  observedFrom: string;
+  observedTo: string;
+}
+
+export interface StatsOverview {
+  degraded: boolean;
+  error?: string;
+  windowHours: number;
+  nodes: StatsOverviewNode[];
+}

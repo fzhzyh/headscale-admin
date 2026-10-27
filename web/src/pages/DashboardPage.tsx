@@ -5,13 +5,21 @@
  * 上游不可用时不能白屏——要把排障建议直接给出来（连接自检带 diagnosis）。
  */
 import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { Button, Alert, Tooltip, Tag, Spin, App as AntApp } from 'antd';
-import { ReloadOutlined, CloudServerOutlined, ThunderboltOutlined, WarningOutlined } from '@ant-design/icons';
+import { Button, Alert, Tooltip, Tag, Spin, Segmented, App as AntApp } from 'antd';
+import { ReloadOutlined, CloudServerOutlined, ThunderboltOutlined, WarningOutlined, AreaChartOutlined } from '@ant-design/icons';
 import { useState } from 'react';
 
 import { api, errorText } from '../api/client';
-import type { Overview } from '../api/types';
+import type {
+  Overview,
+  NodeListResponse,
+  ClusterSeries,
+  StatsOverview,
+  StatsHealth,
+} from '../api/types';
 import { StatCard, PageHeader, StatePill, EmptyState } from '../components/ui';
+import { OnlineTrendChart } from '../components/charts/OnlineTrendChart';
+import { NodeUptimeTable } from '../components/charts/NodeUptimeTable';
 import { useAuth } from '../store/auth';
 
 function fmtLatency(ms?: number): string {
@@ -32,6 +40,44 @@ export default function DashboardPage(): React.ReactElement {
     // 实时推送会 invalidate，这里兜底 60s 一次
     refetchInterval: 60_000,
   });
+
+  // ---------------------------------------------------------------- 时序统计（P4）
+  // 趋势窗口：默认 6h，够看清一次故障；可选 1h/24h/7d。
+  const [hours, setHours] = useState<number>(6);
+
+  const clusterQuery = useQuery({
+    queryKey: ['stats-cluster', hours],
+    queryFn: () => api.get<ClusterSeries>('/api/stats/cluster', { hours }),
+    // 采样间隔 15s，30s 刷新足够；不跟随 WS 是为了避免每条推送都重查时序库
+    refetchInterval: 30_000,
+    retry: 0,
+  });
+
+  const statsOverviewQuery = useQuery({
+    queryKey: ['stats-overview'],
+    queryFn: () => api.get<StatsOverview>('/api/stats/overview'),
+    refetchInterval: 60_000,
+    retry: 0,
+  });
+
+  const statsHealthQuery = useQuery({
+    queryKey: ['stats-health'],
+    queryFn: () => api.get<StatsHealth>('/api/stats/health'),
+    refetchInterval: 60_000,
+    retry: 0,
+  });
+
+  // 用于把「时序里有、headscale 里已没有」的节点标为「已移除」。
+  // 直接用 /api/nodes 的完整返回，不参与筛选，避免和数据页共用一个 queryKey
+  // 造成筛选条件互相覆盖。
+  const liveNodesQuery = useQuery({
+    queryKey: ['nodes-lite-for-stats'],
+    queryFn: () => api.get<NodeListResponse>('/api/nodes'),
+    refetchInterval: 60_000,
+    retry: 0,
+    enabled: can('node:read'),
+  });
+  const liveNodeIds = new Set((liveNodesQuery.data?.nodes ?? []).map((n) => n.id));
 
   const doSync = async (): Promise<void> => {
     setSyncing(true);
@@ -174,6 +220,114 @@ export default function DashboardPage(): React.ReactElement {
         />
       </div>
 
+      {/* 监控统计（P4）：趋势 + 在线时长。
+          放在核心指标之后、风险项之前——先看"现在多少"，再看"过去怎么变"。 */}
+      <div className="mb-4 grid grid-cols-1 gap-4 xl:grid-cols-3">
+        <div className="hsa-card p-5 xl:col-span-2">
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <AreaChartOutlined className="text-brand-500" />
+              <h3 className="text-[14px] font-semibold text-ink-800">在线趋势</h3>
+              <span className="text-[11.5px] text-ink-400">面板采样 → InfluxDB</span>
+            </div>
+            <Segmented
+              size="small"
+              value={hours}
+              onChange={(v) => setHours(Number(v))}
+              options={[
+                { label: '1 小时', value: 1 },
+                { label: '6 小时', value: 6 },
+                { label: '24 小时', value: 24 },
+                { label: '7 天', value: 168 },
+              ]}
+            />
+          </div>
+
+          {clusterQuery.isLoading ? (
+            <div className="flex h-[260px] items-center justify-center">
+              <Spin tip="正在读取时序数据…" />
+            </div>
+          ) : clusterQuery.error ? (
+            <Alert
+              type="warning"
+              showIcon
+              message="读取趋势数据失败"
+              description={<span className="text-[12.5px]">{errorText(clusterQuery.error)}</span>}
+            />
+          ) : (
+            <OnlineTrendChart data={clusterQuery.data} hours={hours} />
+          )}
+        </div>
+
+        {/* 时序库自检：把「采集是否正常」直接摆出来，
+            否则曲线为空时无法区分"没设备在线"和"根本没采到" */}
+        <div className="hsa-card p-5">
+          <div className="mb-3 flex items-center justify-between">
+            <h3 className="text-[14px] font-semibold text-ink-800">时序库</h3>
+            {statsHealthQuery.data ? (
+              statsHealthQuery.data.influx.enabled ? (
+                <StatePill tone="ok">正常</StatePill>
+              ) : (
+                <StatePill tone="danger">不可用</StatePill>
+              )
+            ) : (
+              <span className="text-[11.5px] text-ink-400">检测中…</span>
+            )}
+          </div>
+
+          {statsHealthQuery.data ? (
+            <div className="space-y-2.5 text-[12.5px]">
+              <DetailRow label="InfluxDB" value={<span className="font-mono text-[11.5px]">{statsHealthQuery.data.influx.detail}</span>} />
+              <DetailRow label="已采轮次" value={<span className="font-mono">{statsHealthQuery.data.sampler.recordedRounds}</span>} />
+              <DetailRow label="跟踪设备" value={<span className="font-mono">{statsHealthQuery.data.sampler.trackedNodes}</span>} />
+              <DetailRow label="已写入点" value={<span className="font-mono">{statsHealthQuery.data.writer.written}</span>} />
+              <DetailRow
+                label="丢弃点"
+                value={
+                  statsHealthQuery.data.writer.dropped > 0 ? (
+                    <span className="font-mono text-amber-600">{statsHealthQuery.data.writer.dropped}</span>
+                  ) : (
+                    <span className="font-mono text-ink-500">0</span>
+                  )
+                }
+              />
+              {statsHealthQuery.data.writer.lastError && (
+                <div className="rounded-lg bg-amber-50 px-2.5 py-2 text-[11.5px] leading-relaxed text-amber-700">
+                  最近写入错误（{statsHealthQuery.data.writer.lastErrorAgoSec}s 前）：
+                  <div className="mt-0.5 font-mono break-all">{statsHealthQuery.data.writer.lastError}</div>
+                </div>
+              )}
+              <div className="border-t border-ink-100 pt-2.5 text-[11.5px] leading-relaxed text-ink-400">
+                只统计<b>在线状态</b>与<b>在线时长</b>。设备流量在当前架构下不可得——
+                headscale 是控制面，数据面流量不经它转发。
+              </div>
+            </div>
+          ) : (
+            <div className="text-[12.5px] text-ink-500">
+              {statsHealthQuery.error ? errorText(statsHealthQuery.error) : '检测中…'}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* 设备在线时长（24h 窗口） */}
+      <div className="mb-4">
+        <div className="hsa-card p-5">
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <h3 className="text-[14px] font-semibold text-ink-800">设备在线时长</h3>
+              <span className="text-[11.5px] text-ink-400">近 24 小时 · 按采样点统计</span>
+            </div>
+          </div>
+          <NodeUptimeTable
+            nodes={statsOverviewQuery.data?.nodes}
+            liveNodeIds={liveNodeIds}
+            degraded={statsOverviewQuery.data?.degraded}
+            error={statsOverviewQuery.data?.error}
+          />
+        </div>
+      </div>
+
       {/* 风险项 + 连接详情 */}
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
         <div className="hsa-card hsa-card-hover p-5">
@@ -272,10 +426,12 @@ export default function DashboardPage(): React.ReactElement {
               ['认证 · RBAC · 2FA · 审计', true],
               ['实时推送（WebSocket）', true],
               ['快速连接命令生成', true],
-              ['ACL 可视化编辑与版本历史', false],
-              ['ACL 访问检查求值引擎', false],
-              ['监控统计（在线时长 / 流量）', false],
-              ['网络拓扑与 ACL 访问矩阵', false],
+              ['ACL 可视化编辑与版本历史', true],
+              ['ACL 访问检查求值引擎', true],
+              ['ACL 访问矩阵', true],
+              ['监控统计（在线状态 / 在线时长 / 趋势）', true],
+              ['网络拓扑可视化', false],
+              ['设备流量统计（headscale 架构下不可得）', false],
               ['资源中心', false],
               ['DNS 记录管理', false],
               ['内置 OIDC Provider', false],
