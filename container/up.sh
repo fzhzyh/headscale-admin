@@ -180,8 +180,43 @@ HS_API_KEY="$(tr -d '[:space:]' < "${KEY_FILE}")"
 ok "API Key 就绪（长度 ${#HS_API_KEY}）"
 
 # ---------------------------------------------------------------- 构建并启动面板
+# 先把 Dockerfile 的 FROM 基础镜像拉到本地，再构建。
+# 原因：`container build` 解析 FROM 时要访问 registry，网络一抖就整个构建失败，
+# 只抛一句 `Error: unknown: "HTTPClientError.remoteConnectionClosed"`——
+# 看不出是基础镜像没拉到。预拉一次，失败可重试、可换源、可给出人话提示。
+ensure_base_image() {
+  local img="$1" cand
+  if container image list 2>/dev/null | grep -qE "^${img%:*} +${img##*:}"; then
+    log "基础镜像已在本地：${img}"
+    return 0
+  fi
+  # 原引用失败时，换 docker.io 原名（同一镜像）+ daocloud 加速器
+  local base="${img#*/library/}"
+  base="${base#docker.m.daocloud.io/}"
+  for cand in "${img}" "docker.m.daocloud.io/library/${base}" "docker.io/library/${base}"; do
+    log "拉取基础镜像 ${cand}（--platform ${CTR_PLATFORM}）"
+    if container image pull --platform "${CTR_PLATFORM}" "${cand}" >/dev/null 2>&1; then
+      # 若拉到的是同内容不同引用，打个 :dev 别名不便，直接放行——构建时按 FROM 名字找
+      [ "${cand}" = "${img}" ] || container image tag "${cand}" "${img}" >/dev/null 2>&1 || true
+      ok "基础镜像就绪：${img}"
+      return 0
+    fi
+    log "  ✗ ${cand} 失败"
+  done
+  die "基础镜像拉不到：${img}
+  ⇒ 网络恢复后重试，或手工预拉：
+     container image pull --platform ${CTR_PLATFORM} docker.m.daocloud.io/library/node:22-alpine"
+}
+
+ensure_base_image "docker.m.daocloud.io/library/node:22-alpine"
+
 log "构建面板镜像 ${PANEL_IMAGE}（首次较慢）"
-container build -f "${CTR_DIR}/Dockerfile.panel" -t "${PANEL_IMAGE}" "${ROOT}" >/dev/null
+if ! container build -f "${CTR_DIR}/Dockerfile.panel" -t "${PANEL_IMAGE}" "${ROOT}" >/dev/null; then
+  # 构建失败时把真实错误捞出来（上面重定向到了 /dev/null，单看 exit code 无从判断）
+  log "构建失败，重跑一次以显示完整错误" >&2
+  container build -f "${CTR_DIR}/Dockerfile.panel" -t "${PANEL_IMAGE}" "${ROOT}" >&2 \
+    || die "面板镜像构建失败（见上方构建日志）"
+fi
 ok "面板镜像构建完成"
 
 log "启动面板容器 ${PANEL_CTR}"
