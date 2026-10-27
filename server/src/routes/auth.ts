@@ -68,7 +68,14 @@ function cookieOptions(expiresAt: string): Record<string, unknown> {
 export async function registerAuthRoutes(app: FastifyInstance): Promise<void> {
   // ---------------- 登录 ----------------
   app.post('/api/auth/login', {
-    config: { rateLimit: { max: 20, timeWindow: '5 minutes' } },
+    // 限流数值来自配置：生产默认 20 次 / 5 分钟，
+    // 联调环境由 container/up.sh 放宽（多个测试套件连续登录会撞 429）
+    config: {
+      rateLimit: {
+        max: loadConfig().security.loginRateMax,
+        timeWindow: loadConfig().security.loginRateWindowSec * 1000,
+      },
+    },
     handler: async (req, reply) => {
       const parsed = loginSchema.safeParse(req.body);
       if (!parsed.success) {

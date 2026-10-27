@@ -189,3 +189,52 @@ export function __resetSampler(): void {
   sampleSkipped = 0;
   sampleRecorded = 0;
 }
+
+// ============================================================
+// 面板自身控制面指标（方案 B）
+//
+// **不是设备流量**。设备流量在 headscale 架构下不可得（控制面不转发数据面），
+// 这里统计的是面板自己的 API 吞吐、错误率、延迟与 WS 推送量。
+// 纯函数取参而不 import 指标服务，避免 sampler ↔ hub ↔ metrics 的循环依赖。
+// ============================================================
+
+export interface PanelSample {
+  /** 最近 60 秒的 API 请求数 */
+  rpm: number;
+  /** 5xx 占比（0~1），无请求时传 null */
+  errorRate: number | null;
+  /** API 延迟 p95（毫秒），无样本时传 null */
+  p95Ms: number | null;
+  /** 当前 WS 连接数 */
+  wsClients: number;
+  /** 累计广播事件数 */
+  wsEvents: number;
+  /** 累计下发帧数（客户端数 × 事件） */
+  wsFrames: number;
+  /** 进程启动以来总请求数 */
+  totalRequests: number;
+}
+
+export function recordPanelSnapshot(s: PanelSample, nowMs: number = Date.now()): number {
+  if (!influxEnabled()) return 0;
+  const ts = Math.floor(nowMs / 1000);
+  enqueue([
+    {
+      measurement: 'panel_ctrl',
+      tags: { scope: 'panel' },
+      fields: {
+        rpm: s.rpm,
+        // 没请求时写 -1 而不是 0：0 会被画成「错误率 0%，很健康」，
+        // 而事实是「没有样本，不知道」
+        error_rate: s.errorRate === null ? -1 : s.errorRate,
+        p95_ms: s.p95Ms ?? -1,
+        ws_clients: s.wsClients,
+        ws_events: s.wsEvents,
+        ws_frames: s.wsFrames,
+        total_requests: s.totalRequests,
+      },
+      ts,
+    },
+  ]);
+  return 1;
+}

@@ -16,6 +16,7 @@
  * 用法：node lab/verify_topology_ui.mjs
  */
 import { chromium } from 'playwright';
+import { loginUI } from './_ui.mjs';
 import { readFileSync, existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -163,12 +164,7 @@ page.on('console', (m) => {
 });
 page.on('pageerror', (e) => consoleErrors.push(`PAGEERROR: ${e.message}`));
 
-await page.goto(`${BASE}/login`, { waitUntil: 'networkidle' });
-await page.locator('input').first().fill(USER);
-await page.locator('input[type=password]').fill(PASS);
-await page.locator('button:has-text("登")').click();
-await page.waitForURL(/\/dashboard/, { timeout: 15000 });
-await page.waitForLoadState('networkidle').catch(() => {});
+await loginUI(page, BASE, USER, PASS);
 
 // 通过左侧导航点击进入，顺带验证菜单接线（而不是直接 goto）
 const navLink = page.locator('.ant-menu-item', { hasText: '网络拓扑' }).first();

@@ -8,6 +8,7 @@
  * 用法：PANEL_ADMIN_SECRET=... node lab/verify_acl_ui.mjs [baseUrl]
  */
 import { chromium } from 'playwright';
+import { loginUI } from './_ui.mjs';
 import { setTimeout as sleep } from 'node:timers/promises';
 
 // 地址统一从 container/endpoints.env 取（容器化后服务不在宿主回环上）
@@ -76,15 +77,10 @@ if (!PASS) {
 console.log('='.repeat(88));
 console.log('0. 登录');
 console.log('='.repeat(88));
-await page.goto(`${BASE}/login`, { waitUntil: 'networkidle' });
-await page.locator('input').first().fill(USER);
-await page.locator('input[type=password]').fill(PASS);
-await page.locator('button:has-text("登")').click();
-let loggedIn = true;
-await page.waitForURL(/\/dashboard/, { timeout: 15000 }).catch(() => {
-  loggedIn = false;
-});
-check('登录成功并跳转控制台', loggedIn, page.url());
+// 登录失败会抛出带原因的异常（区分口令错 / 429 限流），
+// 否则下游一堆 DOM 断言会依次超时，掩盖真正的根因
+await loginUI(page, BASE, USER, PASS);
+check('登录成功并跳转控制台', new URL(page.url()).pathname === '/dashboard', page.url());
 
 // ---------------- 侧栏入口 ----------------
 console.log('\n' + '='.repeat(88));

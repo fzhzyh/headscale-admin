@@ -31,6 +31,7 @@ import { registerSettingsRoutes } from './routes/settings.ts';
 import { registerSystemRoutes } from './routes/system.ts';
 import { registerAclRoutes } from './routes/acl.ts';
 import { registerStatsRoutes } from './routes/stats.ts';
+import { recordRequest } from './services/metrics.ts';
 import { registerTopologyRoutes } from './routes/topology.ts';
 import { registerAiRoutes } from './routes/ai.ts';
 import { registerRealtimeRoutes } from './realtime/hub.ts';
@@ -106,6 +107,16 @@ export async function buildApp(): Promise<FastifyInstance> {
     if (req.auth.user.must_change_pwd === 1 && !path.startsWith('/api/auth/')) {
       return reply.code(403).send({ error: 'MUST_CHANGE_PASSWORD', message: '请先修改初始口令' });
     }
+  });
+
+  // ---------- 面板自身指标：记录请求量/错误率/延迟 ----------
+  // 放在鉴权闸门之后注册，保证 401/403 也被统计到（排障时最需要看这类）。
+  // `reply.elapsedTime` 是 Fastify 自己测的毫秒数，比自己掐表更贴近真实耗时。
+  app.addHook('onResponse', async (req: FastifyRequest, reply: FastifyReply) => {
+    const path = req.raw.url?.split('?')[0] ?? req.url;
+    // 静态资源不统计：一次页面加载会带出几十个文件，会把 rpm 冲得没有意义
+    if (!path.startsWith('/api/')) return;
+    recordRequest(req.method, path, reply.statusCode, reply.elapsedTime ?? 0);
   });
 
   // ---------- 统一错误出口 ----------

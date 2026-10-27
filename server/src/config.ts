@@ -101,6 +101,13 @@ export interface AppConfig {
   security: {
     loginMaxFailures: number;
     loginLockoutSec: number;
+    /**
+     * 登录接口的**总尝试**限流（不只失败次数）。
+     * 生产默认 20 次/5 分钟；联调环境会把窗口放宽，
+     * 否则多个测试套件连续登录会撞 429（实测踩到：7 个套件 + 手动探测 > 20 次）。
+     */
+    loginRateMax: number;
+    loginRateWindowSec: number;
     sessionTtlSec: number;
     csrfEnabled: boolean;
     cookieSecure: boolean;
@@ -162,6 +169,8 @@ export function loadConfig(): AppConfig {
     security: {
       loginMaxFailures: envInt('LOGIN_MAX_FAILURES', 5),
       loginLockoutSec: envInt('LOGIN_LOCKOUT_SEC', 900),
+      loginRateMax: envInt('LOGIN_RATE_MAX', 20),
+      loginRateWindowSec: envInt('LOGIN_RATE_WINDOW_SEC', 300),
       sessionTtlSec: envInt('SESSION_TTL_SEC', 43200),
       csrfEnabled: envBool('CSRF_ENABLED', true),
       // 只有 https 才下发 Secure Cookie，否则本机 http 调试会登录不上

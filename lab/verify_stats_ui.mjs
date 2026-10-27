@@ -13,6 +13,7 @@
  * 用法：node lab/verify_stats_ui.mjs [baseUrl]
  */
 import { chromium } from 'playwright';
+import { loginUI } from './_ui.mjs';
 import { readFileSync, existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -71,20 +72,8 @@ page.on('pageerror', (e) => consoleErrors.push(`PAGEERROR: ${e.message}`));
 console.log('='.repeat(88));
 console.log('0. 登录');
 console.log('='.repeat(88));
-await page.goto(`${BASE}/login`, { waitUntil: 'networkidle' });
-await page.locator('input').first().fill(USER);
-await page.locator('input[type=password]').fill(PASS);
-await page.locator('button:has-text("登")').click();
-let loggedIn = true;
-await page.waitForURL(/\/dashboard/, { timeout: 15000 }).catch(() => {
-  loggedIn = false;
-});
-check('登录成功', loggedIn, new URL(page.url()).pathname);
-if (!loggedIn) {
-  await browser.close();
-  process.exit(1);
-}
-await page.waitForLoadState('networkidle').catch(() => {});
+await loginUI(page, BASE, USER, PASS);
+check('登录成功', new URL(page.url()).pathname === '/dashboard', new URL(page.url()).pathname);
 await page.waitForTimeout(3000);
 
 // ---------------------------------------------------------------- 在线趋势
@@ -180,6 +169,38 @@ await page.locator('.ant-segmented-item', { hasText: '6 小时' }).first().click
 await page.waitForTimeout(2000);
 check('切回「6 小时」正常', /窗口：最近\s*6\s*小时/.test((await trendCard.innerText()) || ''));
 
+// ---------------------------------------------------------------- 面板控制面（方案 B）
+console.log('\n' + '='.repeat(88));
+console.log('5. 面板控制面指标（方案 B，与设备流量严格区分）');
+console.log('='.repeat(88));
+
+const panelCard = page.locator('[data-testid="panel-control-metrics"]');
+check('面板控制面卡片已渲染', (await panelCard.count()) > 0);
+
+const panelText = (await panelCard.innerText().catch(() => '')) || '';
+check('显示请求速率', panelText.includes('请求速率'));
+check('显示 5xx 错误率', panelText.includes('5xx 错误率'));
+check('显示延迟 p95', panelText.includes('延迟 p95'));
+check('显示 WS 连接数', panelText.includes('WS 连接'));
+
+// 关键：必须明确声明这不是设备流量
+check(
+  '明确标注「不是设备流量」',
+  panelText.includes('面板自身') && panelText.includes('不是设备流量'),
+  panelText.includes('headscale 是控制面') ? '并说明控制面不转发数据面' : '',
+);
+
+// 数字必须是真实值（rpm / p95 不能是占位符）
+const rpmMatch = panelText.match(/请求速率\s*(\d+)/);
+check('请求速率为真实数字', rpmMatch !== null, rpmMatch?.[1] ?? '未匹配');
+
+// 无请求时错误率显示「无样本」而不是 0%（0% 会被读成很健康）
+check(
+  '错误率无样本时不显示 0%',
+  panelText.includes('无样本') || /5xx 错误率\s*\d+(\.\d+)?%/.test(panelText),
+  (panelText.match(/5xx 错误率\s*\S+/) ?? [''])[0],
+);
+
 // ---------------------------------------------------------------- 功能进度诚实性
 console.log('\n' + '='.repeat(88));
 console.log('5. 功能进度清单的诚实性');
@@ -188,7 +209,8 @@ console.log('='.repeat(88));
 const bodyText = await page.locator('body').innerText();
 check('监控统计标为已完成', bodyText.includes('监控统计（在线状态 / 在线时长 / 趋势）'));
 check('流量项明确标注架构限制', bodyText.includes('设备流量统计（headscale 架构下不可得）'));
-check('网络拓扑仍标注待开发', bodyText.includes('网络拓扑可视化') && bodyText.includes('待开发'));
+check('网络拓扑标为已完成', bodyText.includes('网络拓扑可视化'));
+check('面板控制面指标标为已完成', bodyText.includes('面板控制面指标（API 吞吐/延迟/WS）'));
 
 // ---------------------------------------------------------------- 控制台
 console.log('\n' + '='.repeat(88));

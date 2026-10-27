@@ -21,7 +21,8 @@ import { hs } from '../services/headscale.ts';
 import { getBool, getInt } from '../services/settings.ts';
 import { isNeverExpiring } from '../routes/nodes.ts';
 import { nowIso } from '../util/time.ts';
-import { recordSnapshot, pruneStreaks } from '../timeseries/sampler.ts';
+import { recordSnapshot, pruneStreaks, recordPanelSnapshot } from '../timeseries/sampler.ts';
+import { panelMetrics } from '../services/metrics.ts';
 
 export type Topic = 'nodes' | 'routes' | 'stats';
 
@@ -55,6 +56,14 @@ let lastNodes = new Map<number, string>();
 let lastRoutes = new Map<string, boolean>();
 let lastStats = '';
 
+/** 累计广播事件数（一次 broadcast 算 1）与累计下发帧数（客户端数 × 事件） */
+let broadcastEvents = 0;
+let broadcastFrames = 0;
+
+export function pushCounters(): { events: number; frames: number } {
+  return { events: broadcastEvents, frames: broadcastFrames };
+}
+
 export function wsClientCount(): number {
   return clients.size;
 }
@@ -75,10 +84,16 @@ function send(client: Client, event: WsEvent): void {
 
 /** 按主题广播 */
 function broadcast(topic: Topic, event: WsEvent): void {
+  let sent = 0;
   for (const c of clients.values()) {
     if (!c.topics.has(topic)) continue;
     send(c, event);
+    sent += 1;
   }
+  // 只统计真正发出去的：没有订阅者时 events+1 但 frames+0，
+  // 这样能看出「推了但没人收」——通常是前端没订阅对应主题
+  broadcastEvents += 1;
+  broadcastFrames += sent;
 }
 
 /** 用户可见的主题（按权限收敛） */
@@ -272,6 +287,24 @@ export function startPoller(log: { info: (o: object, m: string) => void; warn: (
   const tick = async (): Promise<void> => {
     try {
       const r = await pollOnce();
+
+      // 面板自身指标随时间写一份，用于「面板慢」与「上游慢」的区分
+      try {
+        const m = panelMetrics();
+        const pc = pushCounters();
+        recordPanelSnapshot({
+          rpm: m.rpm,
+          errorRate: m.errorRate,
+          p95Ms: m.latency.p95,
+          wsClients: wsClientCount(),
+          wsEvents: pc.events,
+          wsFrames: pc.frames,
+          totalRequests: m.total,
+        });
+      } catch {
+        // 指标采集失败绝不能影响推送主链路
+      }
+
       if (r.nodeChanges.length > 0 || r.routeChanges.length > 0) {
         log.info(
           { nodes: r.nodesTotal, online: r.nodesOnline, nodeChanges: r.nodeChanges, routeChanges: r.routeChanges },

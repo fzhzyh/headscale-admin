@@ -16,10 +16,12 @@ import type {
   ClusterSeries,
   StatsOverview,
   StatsHealth,
+  PanelMetrics,
 } from '../api/types';
 import { StatCard, PageHeader, StatePill, EmptyState } from '../components/ui';
 import { OnlineTrendChart } from '../components/charts/OnlineTrendChart';
 import { NodeUptimeTable } from '../components/charts/NodeUptimeTable';
+import { PanelControlPanel } from '../components/charts/PanelControlPanel';
 import { useAuth } from '../store/auth';
 
 function fmtLatency(ms?: number): string {
@@ -57,6 +59,14 @@ export default function DashboardPage(): React.ReactElement {
     queryKey: ['stats-overview'],
     queryFn: () => api.get<StatsOverview>('/api/stats/overview'),
     refetchInterval: 60_000,
+    retry: 0,
+  });
+
+  // 面板自身控制面指标（内存态，无需时序库）
+  const panelMetricsQuery = useQuery({
+    queryKey: ['stats-panel'],
+    queryFn: () => api.get<PanelMetrics>('/api/stats/panel'),
+    refetchInterval: 15_000,
     retry: 0,
   });
 
@@ -328,6 +338,25 @@ export default function DashboardPage(): React.ReactElement {
         </div>
       </div>
 
+      {/* 面板自身控制面指标（方案 B）：与设备统计分开，避免混淆 */}
+      <div className="mb-4">
+        <div className="hsa-card p-5">
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <h3 className="text-[14px] font-semibold text-ink-800">面板控制面</h3>
+              <span className="text-[11.5px] text-ink-400">
+                最近 {panelMetricsQuery.data?.windowSec ?? 60} 秒 · 用于区分「上游慢」与「面板慢」
+              </span>
+            </div>
+          </div>
+          <PanelControlPanel
+            data={panelMetricsQuery.data}
+            error={panelMetricsQuery.error}
+            loading={panelMetricsQuery.isLoading}
+          />
+        </div>
+      </div>
+
       {/* 风险项 + 连接详情 */}
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
         <div className="hsa-card hsa-card-hover p-5">
@@ -430,7 +459,8 @@ export default function DashboardPage(): React.ReactElement {
               ['ACL 访问检查求值引擎', true],
               ['ACL 访问矩阵', true],
               ['监控统计（在线状态 / 在线时长 / 趋势）', true],
-              ['网络拓扑可视化', false],
+              ['网络拓扑可视化', true],
+              ['面板控制面指标（API 吞吐/延迟/WS）', true],
               ['设备流量统计（headscale 架构下不可得）', false],
               ['资源中心', false],
               ['DNS 记录管理', false],

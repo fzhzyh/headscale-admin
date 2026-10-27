@@ -538,3 +538,33 @@ export interface TopologyResponse {
   };
   notes: { edges: string; traffic: string };
 }
+
+// ============================================================
+// 面板自身控制面指标（方案 B）
+//
+// ⚠️ **不是设备流量**。设备流量在 headscale 架构下不可得。
+// 这里统计面板自己的 API 吞吐、错误率、延迟、WS 推送量——
+// 用于区分「上游 headscale 慢」与「面板自己慢」。
+// ============================================================
+
+export interface PanelMetrics {
+  total: number;
+  /** 最近 60 秒请求数 */
+  rpm: number;
+  status: { s2xx: number; s3xx: number; s4xx: number; s5xx: number };
+  /** 5xx 占比（0~1）；无请求时为 null（不是 0——没样本不等于很健康） */
+  errorRate: number | null;
+  latency: { p50: number | null; p95: number | null; p99: number | null; samples: number };
+  topRoutes: { route: string; count: number; errors: number; avgMs: number }[];
+  uptimeSec: number;
+  windowSec: number;
+  ws: {
+    clients: number;
+    events: number;
+    frames: number;
+    /** 有事件但零帧 → 推了没人订阅 */
+    noSubscriber: boolean;
+  };
+  scope: 'panel';
+  disclaimer: string;
+}

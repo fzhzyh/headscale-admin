@@ -68,6 +68,7 @@ def suites() -> list[Suite]:
         Suite("认证原语单元", "tsx", "src/auth/secrets.test.ts", cwd=SERVER),
         Suite("ACL 求值引擎单元", "tsx", "src/acl/evaluator.test.ts", cwd=SERVER),
         Suite("时序层单元", "tsx", "src/timeseries/influx.test.ts", cwd=SERVER),
+        Suite("控制面指标单元", "tsx", "src/services/metrics.test.ts", cwd=SERVER),
         # —— 端到端：依赖容器化环境 ——
         Suite("P1 面板后端 e2e", "python", "e2e_panel.py"),
         Suite("P1 2FA e2e", "python", "e2e_2fa.py"),

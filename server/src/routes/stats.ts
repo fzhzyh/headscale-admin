@@ -23,6 +23,8 @@ import { requirePermission } from '../auth/guard.ts';
 import { loadConfig } from '../config.ts';
 import { influxHealth, queryFlux, writeStats } from '../timeseries/influx.ts';
 import { samplerStats } from '../timeseries/sampler.ts';
+import { panelMetrics } from '../services/metrics.ts';
+import { pushCounters, wsClientCount } from '../realtime/hub.ts';
 
 /** 桶名从配置读，避免硬编码 */
 function bucket(): string {
@@ -240,6 +242,32 @@ export async function registerStatsRoutes(app: FastifyInstance): Promise<void> {
     })).sort((a, b) => a.nodeId - b.nodeId);
 
     return reply.send({ degraded: false, windowHours: 24, nodes });
+  });
+
+  // ---------------------------------------------------------------- 面板自身控制面指标
+  /**
+   * 注意：这是**面板自己的**指标，不是设备流量。
+   * 设备流量在 headscale 架构下不可得（见 /api/stats/traffic）。
+   * 之所以做这个：面板是运维唯一入口，它慢/报错时用户第一反应是「网络坏了」。
+   * 有 rpm / 5xx 率 / p95 就能区分「上游 headscale 慢」与「面板自己慢」。
+   */
+  app.get('/api/stats/panel', { preHandler: requirePermission('node:read') }, async (_req, reply) => {
+    const m = panelMetrics();
+    const pc = pushCounters();
+    return reply.send({
+      ...m,
+      ws: {
+        clients: wsClientCount(),
+        events: pc.events,
+        frames: pc.frames,
+        // 事件有、帧为 0 → 推了但没人订阅，通常是前端主题订阅错了
+        noSubscriber: pc.events > 0 && pc.frames === 0,
+      },
+      scope: 'panel',
+      disclaimer:
+        '这是面板自身的控制面指标，**不是设备流量**。设备流量在 headscale 架构下不可得：' +
+        'headscale 是控制面，设备间数据面流量由 WireGuard 直连，不经过它。',
+    });
   });
 
   // ---------------------------------------------------------------- 流量：明确不可用

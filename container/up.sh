@@ -306,6 +306,8 @@ container run -d --name "${PANEL_CTR}" --network "${NET}" \
   -e HS_GRPC_ADDR="${HS_IP}:50443" \
   -e HS_API_KEY="${HS_API_KEY}" \
   -e HS_TRANSPORT=rest \
+  -e LOGIN_RATE_MAX="${LOGIN_RATE_MAX_LAB:-300}" \
+  -e LOGIN_RATE_WINDOW_SEC=300 \
   -e INFLUX_URL="http://${INFLUX_IP}:8086" \
   -e INFLUX_ORG="${INFLUX_ORG}" \
   -e INFLUX_BUCKET="${INFLUX_BUCKET}" \

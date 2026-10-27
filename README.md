@@ -156,9 +156,10 @@ npm run dev
 | **P2** | 实时推送（WebSocket）、前端 SPA（控制台、设备、用户、密钥、路由、账户角色、快速连接、审计、设置） | ✅ 已完成 |
 | **P3** | ACL 引擎：可视化编辑、原始 HuJSON、版本历史、访问检查求值器、访问矩阵、AI 辅助 | ✅ 已完成 |
 | **P4** | 监控：InfluxDB 时序采样、在线状态/在线时长、趋势图、**网络拓扑（ACL 逐对求值）** | ✅ 已完成 |
+| **P4+** | 面板自身控制面指标（API 吞吐/错误率/延迟分位/WS 推送量） | ✅ 已完成 |
 | **P5** | 资源中心、DNS 热加载、内置 OIDC Provider、外部 OIDC 登录 | 待开发 |
 
-### 已验证（共 432 项用例，全通过）
+### 已验证（共 479 项用例，全通过）
 
 | 脚本 | 项数 | 覆盖 |
 |------|------|------|
@@ -172,6 +173,7 @@ npm run dev
 | `lab/verify_acl_semantics.py` | 6 | 面板求值结论与上游 `/debug/filter` 编译结果**交叉验证**（含 `{}` vs `{"acls":[]}` 的危险区分）。容器模式下整体 SKIP（该端点仅限本机回环） |
 | `server/src/timeseries/influx.test.ts` | 24 | line protocol 转义/类型/空 field 丢弃、**annotated CSV 解析**（含 `pivot()` 后无 `_value` 列的回归用例） |
 | `lab/verify_stats_ui.mjs` | 28 | 趋势图真实 svg/图例/坐标轴/面积层/**折线层**、时序库自检显示真实写入计数、时长表列头与实际观测区间、窗口切换、**「流量不可得」是否如实告知**、无运行时异常 |
+| `server/src/services/metrics.test.ts` | 38 | 路径归一化（`/api/nodes/123` → `/:id`，令牌段 → `/:key`）、状态分类、**无请求时 errorRate 为 null 而非 0**、分位边界（单样本/零样本）、指标接口自身不计入（防自我放大）、NaN 耗时安全处理 |
 | `lab/verify_topology_ui.mjs` | 32 | 拓扑画布与节点数、**边数与 ACL 语义一致**（全通 12 条 → 限制性策略精确 4 条且方向无反边）、**高危护栏 409 NEED_ACK**、全通/全禁不画 N² 箭头、只看在线过滤、语义说明诚实性 |
 
 另有 `server/src/acl/evaluator.test.ts` 56 项 ACL 求值单元测试。
