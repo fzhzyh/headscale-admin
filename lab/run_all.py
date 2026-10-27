@@ -78,6 +78,7 @@ def suites() -> list[Suite]:
         # —— 前端 DOM 断言 ——
         Suite("P2 前端", "node", "verify_web.mjs"),
         Suite("P4 统计前端", "node", "verify_stats_ui.mjs"),
+        Suite("P4 拓扑前端", "node", "verify_topology_ui.mjs"),
         Suite("P3 ACL 前端", "node", "verify_acl_ui.mjs"),
     ]
 

@@ -486,3 +486,55 @@ export interface StatsOverview {
   windowHours: number;
   nodes: StatsOverviewNode[];
 }
+
+// ============================================================
+// 网络拓扑（P4）
+//
+// 边来源：后端逐对调用 ACL 求值引擎（与「访问检查」同一套），
+// 不是照抄策略文本——选择器展开、autogroup:self、出口节点、子网路由
+// 这些语义手工画不准。
+// ============================================================
+
+export interface TopologyNode {
+  id: number;
+  name: string;
+  displayName: string;
+  ips: string[];
+  online: boolean;
+  expired: boolean;
+  user: string | null;
+  tags: string[];
+  isExitNode: boolean;
+  approvedRoutes: string[];
+  /** 标签设备已脱离用户归属，展示上要区分 */
+  identity: 'user' | 'tagged';
+}
+
+export interface TopologyEdge {
+  from: number;
+  to: number;
+  ruleIndex: number | null;
+  matchedSrc: string;
+  matchedDst: string;
+}
+
+export interface TopologyResponse {
+  /** allow-all / deny-all 时不画边，由 mode 表达结论 */
+  mode: 'allow-all' | 'deny-all' | 'rules';
+  explanation: string;
+  highImpact: boolean;
+  source: string;
+  nodes: TopologyNode[];
+  edges: TopologyEdge[];
+  users: { name: string; deviceCount: number }[];
+  stats: {
+    nodeCount: number;
+    consideredCount: number;
+    pairEvaluated: number;
+    allowedEdges: number;
+    maxPairs: number;
+    /** 设备过多导致逐对求值被截断——未算过的组合不会出现在图上 */
+    truncated: boolean;
+  };
+  notes: { edges: string; traffic: string };
+}

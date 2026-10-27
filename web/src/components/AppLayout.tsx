@@ -22,6 +22,7 @@ import {
   MenuUnfoldOutlined,
   WifiOutlined,
   DisconnectOutlined,
+  ApartmentOutlined,
 } from '@ant-design/icons';
 import { Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
@@ -45,6 +46,7 @@ interface NavItem {
 const NAV: NavItem[] = [
   { key: '/dashboard', label: '控制台', icon: <DashboardOutlined />, group: '概览', perms: ['node:read'] },
   { key: '/nodes', label: '设备管理', icon: <ClusterOutlined />, group: '网络', perms: ['node:read'] },
+  { key: '/topology', label: '网络拓扑', icon: <ApartmentOutlined />, group: '网络', perms: ['node:read'] },
   { key: '/routes', label: '路由管理', icon: <PartitionOutlined />, group: '网络', perms: ['route:read'] },
   { key: '/users', label: '网络用户', icon: <TeamOutlined />, group: '网络', perms: ['user:read'] },
   { key: '/acl', label: 'ACL 管理', icon: <SafetyCertificateOutlined />, group: '网络', perms: ['acl:read'] },
