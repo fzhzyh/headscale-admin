@@ -24,14 +24,21 @@ NET="${HS_NET:-hs-lab-net}"
 NET_SUBNET="${HS_NET_SUBNET:-192.168.80.0/24}"
 HS_CTR="${HS_CONTAINER:-hs-lab}"
 PANEL_CTR="${PANEL_CONTAINER:-hs-panel}"
+INFLUX_CTR="${INFLUX_CONTAINER:-hs-influx}"
 HS_IMAGE_DEFAULT="${HS_IMAGE:-ghcr.io/juanfont/headscale:v0.29.6}"
 PANEL_IMAGE="${PANEL_IMAGE:-headscale-admin-panel:dev}"
+INFLUX_IMAGE="${INFLUX_IMAGE:-docker.m.daocloud.io/library/influxdb:2.7-alpine}"
 PUB_IP="${PUBLIC_IP:-100.64.0.3}"
+
+# InfluxDB 组织/桶（时序数据落这里）
+INFLUX_ORG="${INFLUX_ORG_NAME:-headscale}"
+INFLUX_BUCKET="${INFLUX_BUCKET_NAME:-headscale_admin}"
 
 HS_PUB_PORT=18080
 METRICS_PUB_PORT=19090
 GRPC_PUB_PORT=50443
 PANEL_PUB_PORT=8080
+INFLUX_PUB_PORT=18086
 
 log()  { printf '\033[36m▸\033[0m %s\n' "$*"; }
 ok()   { printf '\033[32m✓\033[0m %s\n' "$*"; }
@@ -66,7 +73,7 @@ else
 fi
 
 # ---------------------------------------------------------------- 清理旧容器
-for c in "${HS_CTR}" "${PANEL_CTR}"; do
+for c in "${HS_CTR}" "${PANEL_CTR}" "${INFLUX_CTR}"; do
   if container list --all 2>/dev/null | awk '{print $1}' | grep -qx "${c}"; then
     log "移除同名旧容器 ${c}"
     container stop "${c}" >/dev/null 2>&1 || true
@@ -159,7 +166,13 @@ if [ ! -f "${ENV_FILE}" ]; then
 PANEL_MASTER_KEY=$(openssl rand -hex 32)
 PANEL_SESSION_SECRET=$(openssl rand -hex 32)
 PANEL_ADMIN_SECRET=$(openssl rand -base64 18 | tr -d '/+=' | head -c 20)
+INFLUX_ADMIN_SECRET=$(openssl rand -base64 18 | tr -d '/+=' | head -c 20)
 EOF
+  chmod 600 "${ENV_FILE}"
+fi
+# 老版本 lab.env 没有 InfluxDB 口令：补齐（不重播种，避免把已有面板口令冲掉）
+if ! grep -q '^INFLUX_ADMIN_SECRET=' "${ENV_FILE}" 2>/dev/null; then
+  printf 'INFLUX_ADMIN_SECRET=%s\n' "$(openssl rand -base64 18 | tr -d '/+=' | head -c 20)" >> "${ENV_FILE}"
   chmod 600 "${ENV_FILE}"
 fi
 # shellcheck disable=SC1090
@@ -178,6 +191,61 @@ fi
 HS_API_KEY="$(tr -d '[:space:]' < "${KEY_FILE}")"
 [ -n "${HS_API_KEY}" ] || die "API Key 为空：${KEY_FILE}"
 ok "API Key 就绪（长度 ${#HS_API_KEY}）"
+
+# ---------------------------------------------------------------- InfluxDB（时序库）
+# 用途：设备在线状态 / 在线时长的历史曲线（P4）。
+#
+# ⚠️ 为什么只存「在线状态」不存「流量」：
+# headscale 是**控制面**，只协调握手与下发 ACL/路由，端到端的数据流量是
+# WireGuard 在设备之间直连的，不经过 headscale。因此 headscale 的 /metrics
+# 里没有任何 bytes/traffic 指标（v0.29.6 实测只有 nodestore 内部计数），
+# REST 节点对象也没有流量字段。要拿真实流量必须在每台设备上跑 agent 读
+# tailscaled，本实验环境是 debug/node 合成的节点，没有 tailscaled。
+# ⇒ 宁可不画，不造假数据。
+INFLUX_TOKEN_FILE="${STATE_DIR}/influx-token"
+if [ ! -s "${INFLUX_TOKEN_FILE}" ]; then
+  openssl rand -hex 32 > "${INFLUX_TOKEN_FILE}"
+  chmod 600 "${INFLUX_TOKEN_FILE}"
+fi
+INFLUX_TOKEN="$(tr -d '[:space:]' < "${INFLUX_TOKEN_FILE}")"
+
+if ! container image list 2>/dev/null | grep -q "influxdb"; then
+  log "本机无 InfluxDB 镜像，尝试拉取（--platform ${CTR_PLATFORM}）"
+  container image pull --platform "${CTR_PLATFORM}" "${INFLUX_IMAGE}" >/dev/null 2>&1 \
+    || die "InfluxDB 镜像拉取失败：${INFLUX_IMAGE}
+  ⇒ 手工预拉后重试：
+     container image pull --platform ${CTR_PLATFORM} ${INFLUX_IMAGE}"
+fi
+
+log "启动 InfluxDB 容器 ${INFLUX_CTR}"
+mkdir -p "${STATE_DIR}/influx" "${STATE_DIR}/influx-etc"
+# ⚠️ --user influxdb 不是随便加的，两个原因缺一不可：
+#   1) /entrypoint.sh 里的 chown/chmod 只在 id -u == 0 时执行，而 Apple container
+#      的 virtiofs 挂载**不允许 chown**（实测 `chown: /var/lib/influxdb2:
+#      Operation not permitted` → 容器直接退出，日志只有两行 chmod/chown 报错）。
+#      降为非 root 即跳过该分支。
+#   2) 实测非 root（uid=1000 influxdb）对挂载卷是**可写**的，所以降权不牺牲持久化。
+# 另挂 /etc/influxdb2：INIT_MODE=setup 会写 config.yml，镜像层对非 root 只读。
+container run -d --name "${INFLUX_CTR}" --network "${NET}" \
+  --user influxdb \
+  -v "${STATE_DIR}/influx:/var/lib/influxdb2" \
+  -v "${STATE_DIR}/influx-etc:/etc/influxdb2" \
+  -e DOCKER_INFLUXDB_INIT_MODE=setup \
+  -e DOCKER_INFLUXDB_INIT_USERNAME=admin \
+  -e DOCKER_INFLUXDB_INIT_PASSWORD="${INFLUX_ADMIN_SECRET}" \
+  -e DOCKER_INFLUXDB_INIT_ORG="${INFLUX_ORG}" \
+  -e DOCKER_INFLUXDB_INIT_BUCKET="${INFLUX_BUCKET}" \
+  -e DOCKER_INFLUXDB_INIT_ADMIN_TOKEN="${INFLUX_TOKEN}" \
+  -e DOCKER_INFLUXDB_INIT_RETENTION=90d \
+  "${INFLUX_IMAGE}" >/dev/null
+
+log "等待 InfluxDB 就绪"
+INFLUX_IP="$(wait_http "${INFLUX_CTR}" 8086 /health 60)" || {
+  echo "---- InfluxDB 日志 ----" >&2
+  container logs "${INFLUX_CTR}" 2>&1 | tail -30 >&2
+  die "InfluxDB 未在 120s 内就绪"
+}
+ok "InfluxDB 已就绪（${INFLUX_IP}:8086，org=${INFLUX_ORG} bucket=${INFLUX_BUCKET}）"
 
 # ---------------------------------------------------------------- 构建并启动面板
 # 先把 Dockerfile 的 FROM 基础镜像拉到本地，再构建。
@@ -238,6 +306,10 @@ container run -d --name "${PANEL_CTR}" --network "${NET}" \
   -e HS_GRPC_ADDR="${HS_IP}:50443" \
   -e HS_API_KEY="${HS_API_KEY}" \
   -e HS_TRANSPORT=rest \
+  -e INFLUX_URL="http://${INFLUX_IP}:8086" \
+  -e INFLUX_ORG="${INFLUX_ORG}" \
+  -e INFLUX_BUCKET="${INFLUX_BUCKET}" \
+  -e INFLUX_TOKEN="${INFLUX_TOKEN}" \
   "${PANEL_IMAGE}" >/dev/null
 
 log "等待面板就绪"
@@ -310,6 +382,7 @@ nohup python3 "${ROOT}/lab/hostport.py" \
   "${HS_PUB_PORT}=${HS_IP}:8080" \
   "${METRICS_PUB_PORT}=${HS_IP}:9090" \
   "${GRPC_PUB_PORT}=${HS_IP}:50443" \
+  "${INFLUX_PUB_PORT}=${INFLUX_IP}:8086" \
   > "${STATE_DIR}/hostport.log" 2>&1 &
 echo $! > "${PID_FILE}"
 sleep 2
@@ -322,10 +395,13 @@ cat > "${CTR_DIR}/endpoints.env" <<EOF
 PANEL_URL=http://${PUB_IP}:${PANEL_PUB_PORT}
 HS_URL=http://${PUB_IP}:${HS_PUB_PORT}
 HS_DEBUG_URL=http://${PUB_IP}:${METRICS_PUB_PORT}
+INFLUX_URL=http://${PUB_IP}:${INFLUX_PUB_PORT}
 HS_CONTAINER=${HS_CTR}
 PANEL_CONTAINER=${PANEL_CTR}
+INFLUX_CONTAINER=${INFLUX_CTR}
 HS_CONTAINER_IP=${HS_IP}
 PANEL_CONTAINER_IP=${PANEL_IP}
+INFLUX_CONTAINER_IP=${INFLUX_IP}
 EOF
 
 echo
@@ -334,6 +410,7 @@ ok "容器化联调环境已就绪"
 echo "  面板        http://${PUB_IP}:${PANEL_PUB_PORT}"
 echo "  headscale   http://${PUB_IP}:${HS_PUB_PORT}"
 echo "  指标        http://${PUB_IP}:${METRICS_PUB_PORT}"
+echo "  InfluxDB    http://${PUB_IP}:${INFLUX_PUB_PORT}"
 echo "  管理员      admin / ${PANEL_ADMIN_SECRET}"
 echo "  （密钥见 container/lab.env，地址见 container/endpoints.env）"
 echo "────────────────────────────────────────────────────────"

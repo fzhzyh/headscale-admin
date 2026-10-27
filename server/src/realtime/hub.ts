@@ -21,6 +21,7 @@ import { hs } from '../services/headscale.ts';
 import { getBool, getInt } from '../services/settings.ts';
 import { isNeverExpiring } from '../routes/nodes.ts';
 import { nowIso } from '../util/time.ts';
+import { recordSnapshot, pruneStreaks } from '../timeseries/sampler.ts';
 
 export type Topic = 'nodes' | 'routes' | 'stats';
 
@@ -152,6 +153,13 @@ export interface PollResult {
  */
 export async function pollOnce(): Promise<PollResult> {
   const nodes = (await hs().listNodes()) as unknown as NodeLike[];
+
+  // ---------- 时序采样 ----------
+  // 放在差异计算之前：采样是「记录事实」，不该因为后面的推送逻辑异常而漏采。
+  // 失败已在 influx.ts 内部吞掉并计数，这里不需要 try/catch——
+  // 若 recordSnapshot 自身抛错（不该发生），让 pollOnce 的调用方处理。
+  recordSnapshot(nodes as unknown as Parameters<typeof recordSnapshot>[0]);
+  pruneStreaks(nodes.map((n) => n.id));
 
   // ---------- 节点差异 ----------
   const nextNodes = new Map<number, string>();

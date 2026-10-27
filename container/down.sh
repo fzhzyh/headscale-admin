@@ -12,6 +12,7 @@ STATE_DIR="${CTR_DIR}/state"
 
 HS_CTR="${HS_CONTAINER:-hs-lab}"
 PANEL_CTR="${PANEL_CONTAINER:-hs-panel}"
+INFLUX_CTR="${INFLUX_CONTAINER:-hs-influx}"
 NET="${HS_NET:-hs-lab-net}"
 
 log() { printf '\033[36m▸\033[0m %s\n' "$*"; }
@@ -31,7 +32,7 @@ if [ -f "${PID_FILE}" ]; then
   rm -f "${PID_FILE}"
 fi
 
-for c in "${PANEL_CTR}" "${HS_CTR}"; do
+for c in "${PANEL_CTR}" "${INFLUX_CTR}" "${HS_CTR}"; do
   if container list --all 2>/dev/null | awk '{print $1}' | grep -qx "${c}"; then
     log "停止并删除容器 ${c}"
     container stop "${c}" >/dev/null 2>&1 || true
