@@ -687,3 +687,54 @@ export interface DnsApplyResult {
   replaced: number;
   note: string;
 }
+
+// ============================================================
+// 内置 OIDC Provider（P5）
+//
+// 面板作为认证源供 headscale 对接。私钥加密落库，JWKS 只公开公钥。
+// client_secret 只在创建/轮换时返回一次明文。
+// ============================================================
+
+export interface OidcClient {
+  id: number;
+  clientId: string;
+  name: string;
+  redirectUris: string[];
+  postLogoutUris: string[];
+  scopes: string[];
+  grantTypes: string[];
+  isPublic: boolean;
+  requirePkce: boolean;
+  enabled: boolean;
+  /** 只回显前缀，不回显 secret 本体 */
+  secretPrefix: string | null;
+  secretRotatedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface OidcClientList {
+  clients: OidcClient[];
+}
+
+export interface OidcCreatedClient {
+  client: OidcClient | null;
+  /** 仅此一次返回明文；之后只有哈希 */
+  clientSecret: string | null;
+  note: string;
+}
+
+export interface OidcKeyInfo {
+  kid: string;
+  alg: string;
+  active: boolean;
+  createdAt: string;
+  retiredAt: string | null;
+}
+
+export interface OidcKeysResponse {
+  keys: OidcKeyInfo[];
+  jwksUri: string;
+  issuer: string;
+  headscaleConfig: { issuer: string; client_id: string; note: string };
+}

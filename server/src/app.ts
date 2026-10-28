@@ -35,6 +35,7 @@ import { recordRequest } from './services/metrics.ts';
 import { registerTopologyRoutes } from './routes/topology.ts';
 import { registerResourceRoutes } from './routes/resources.ts';
 import { registerDnsRoutes } from './routes/dns.ts';
+import { registerOidcRoutes } from './routes/oidc.ts';
 import { registerAiRoutes } from './routes/ai.ts';
 import { registerRealtimeRoutes } from './realtime/hub.ts';
 
@@ -61,10 +62,25 @@ const PUBLIC_PATHS = new Set([
   '/api/ws',
 ]);
 
+/**
+ * OIDC Provider 的**协议端点**必须无会话可访问（下游 headscale 不会带面板 Cookie）：
+ *   发现文档 / JWKS / token / userinfo / logout
+ * 但 `/api/oidc/*` 是**管理端点**，必须走会话闸门。
+ *
+ * ⚠️ 早期写成 `path.startsWith('/api/oidc/')` 把管理端点一起放行了——
+ * 那等于 OIDC 客户端管理完全裸奔（任何人可增删客户端、轮换密钥）。
+ */
+const PUBLIC_OIDC_PATHS = new Set([
+  '/.well-known/openid-configuration',
+  '/oidc/jwks',
+  '/oidc/token',
+  '/oidc/userinfo',
+  '/oidc/logout',
+]);
+
 function isPublic(path: string): boolean {
   if (PUBLIC_PATHS.has(path)) return true;
-  // OIDC Provider 端点与外部 OIDC 回调不带面板会话
-  return path.startsWith('/api/oidc/');
+  return PUBLIC_OIDC_PATHS.has(path);
 }
 
 export async function buildApp(): Promise<FastifyInstance> {
@@ -175,6 +191,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   await registerTopologyRoutes(app);
   await registerResourceRoutes(app);
   await registerDnsRoutes(app);
+  await registerOidcRoutes(app);
   await registerAiRoutes(app);
   // WebSocket 实时推送（必须最后注册，避免与静态资源/SPA 回退冲突）
   await registerRealtimeRoutes(app);

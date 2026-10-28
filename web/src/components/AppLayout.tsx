@@ -25,6 +25,7 @@ import {
   ApartmentOutlined,
   DatabaseOutlined,
   GlobalOutlined,
+  SafetyOutlined,
 } from '@ant-design/icons';
 import { Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
@@ -57,6 +58,7 @@ const NAV: NavItem[] = [
   { key: '/keys', label: '密钥管理', icon: <KeyOutlined />, group: '网络', perms: ['preauthkey:read', 'apikey:read'] },
   { key: '/connect', label: '快速连接', icon: <ApiOutlined />, group: '网络', perms: ['node:read'] },
   { key: '/panel-users', label: '面板账户', icon: <UserOutlined />, group: '治理', perms: ['paneluser:read', 'group:read'] },
+  { key: '/oidc', label: 'OIDC Provider', icon: <SafetyOutlined />, group: '治理', perms: ['oidc:read'] },
   { key: '/audit', label: '审计日志', icon: <FileSearchOutlined />, group: '治理', perms: ['audit:read'] },
   { key: '/settings', label: '系统设置', icon: <SettingOutlined />, group: '治理', perms: ['settings:read'] },
 ];

@@ -213,6 +213,8 @@ check('网络拓扑标为已完成', bodyText.includes('网络拓扑可视化'))
 check('面板控制面指标标为已完成', bodyText.includes('面板控制面指标（API 吞吐/延迟/WS）'));
 check('资源中心标为已完成', bodyText.includes('资源中心（IP+端口 → ACL hosts 同步）'));
 check('DNS 记录标为已完成', bodyText.includes('DNS 额外记录（热加载）'));
+check('内置 OIDC Provider 标为已完成', bodyText.includes('内置 OIDC Provider（RS256 + JWKS + 授权码流）'));
+check('外部 OIDC 登录标注为不做', bodyText.includes('外部 OIDC 登录（按需求不做）'));
 
 // ---------------------------------------------------------------- 控制台
 console.log('\n' + '='.repeat(88));

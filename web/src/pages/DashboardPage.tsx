@@ -464,8 +464,8 @@ export default function DashboardPage(): React.ReactElement {
               ['设备流量统计（headscale 架构下不可得）', false],
               ['资源中心（IP+端口 → ACL hosts 同步）', true],
               ['DNS 额外记录（热加载）', true],
-              ['内置 OIDC Provider', false],
-              ['外部 OIDC 登录', false],
+              ['内置 OIDC Provider（RS256 + JWKS + 授权码流）', true],
+              ['外部 OIDC 登录（按需求不做）', false],
             ].map(([label, done]) => (
               <div key={String(label)} className="flex items-center gap-2 text-[12.5px]">
                 {done ? (
