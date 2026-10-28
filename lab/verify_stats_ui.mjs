@@ -201,20 +201,25 @@ check(
   (panelText.match(/5xx 错误率\s*\S+/) ?? [''])[0],
 );
 
-// ---------------------------------------------------------------- 功能进度诚实性
+// ---------------------------------------------------------------- 功能进度清单移除后的回归
 console.log('\n' + '='.repeat(88));
-console.log('5. 功能进度清单的诚实性');
+console.log('5. 功能进度清单已移除 + 能力边界未丢失');
 console.log('='.repeat(88));
 
 const bodyText = await page.locator('body').innerText();
-check('监控统计标为已完成', bodyText.includes('监控统计（在线状态 / 在线时长 / 趋势）'));
-check('流量项明确标注架构限制', bodyText.includes('设备流量统计（headscale 架构下不可得）'));
-check('网络拓扑标为已完成', bodyText.includes('网络拓扑可视化'));
-check('面板控制面指标标为已完成', bodyText.includes('面板控制面指标（API 吞吐/延迟/WS）'));
-check('资源中心标为已完成', bodyText.includes('资源中心（IP+端口 → ACL hosts 同步）'));
-check('DNS 记录标为已完成', bodyText.includes('DNS 额外记录（热加载）'));
-check('内置 OIDC Provider 标为已完成', bodyText.includes('内置 OIDC Provider（RS256 + JWKS + 授权码流）'));
-check('外部 OIDC 登录标注为不做', bodyText.includes('外部 OIDC 登录（按需求不做）'));
+// 「功能进度」清单已按需求移除。原先它承担两件事，现在分别验证：
+//   a) 清单本身确实不在页面上了
+//   b) 它原本要传达的「能力边界」改由具体功能卡片承载（不能因此丢失）
+check('「功能进度」清单已移除', !bodyText.includes('功能进度') && !bodyText.includes('待开发'));
+
+// 能力边界必须仍在页面上体现——由「时序库」卡片的脚注承载
+const timelineCard = page.locator('.hsa-card', { hasText: '时序库' }).first();
+const timelineText = (await timelineCard.innerText().catch(() => '')) || '';
+check(
+  '能力边界未丢失：时序库卡片仍说明「设备流量不可得」',
+  timelineText.includes('流量') && timelineText.includes('不可得'),
+  timelineText.includes('控制面') ? '并说明 headscale 是控制面' : '',
+);
 
 // ---------------------------------------------------------------- 控制台
 console.log('\n' + '='.repeat(88));

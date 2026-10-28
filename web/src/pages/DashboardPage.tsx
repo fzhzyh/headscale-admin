@@ -445,41 +445,6 @@ export default function DashboardPage(): React.ReactElement {
         </div>
       </div>
 
-      {/* 功能进度说明：诚实标注未完成部分，避免误以为已有能力 */}
-      <div className="mt-4">
-        <div className="hsa-card p-5">
-          <h3 className="mb-3 text-[14px] font-semibold text-ink-800">功能进度</h3>
-          <div className="grid grid-cols-1 gap-2.5 md:grid-cols-2 xl:grid-cols-3">
-            {[
-              ['设备 / 用户 / 密钥 / 路由管理', true],
-              ['认证 · RBAC · 2FA · 审计', true],
-              ['实时推送（WebSocket）', true],
-              ['快速连接命令生成', true],
-              ['ACL 可视化编辑与版本历史', true],
-              ['ACL 访问检查求值引擎', true],
-              ['ACL 访问矩阵', true],
-              ['监控统计（在线状态 / 在线时长 / 趋势）', true],
-              ['网络拓扑可视化', true],
-              ['面板控制面指标（API 吞吐/延迟/WS）', true],
-              ['设备流量统计（headscale 架构下不可得）', false],
-              ['资源中心（IP+端口 → ACL hosts 同步）', true],
-              ['DNS 额外记录（热加载）', true],
-              ['内置 OIDC Provider（RS256 + JWKS + 授权码流）', true],
-              ['外部 OIDC 登录（按需求不做）', false],
-            ].map(([label, done]) => (
-              <div key={String(label)} className="flex items-center gap-2 text-[12.5px]">
-                {done ? (
-                  <span className="flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-emerald-100 text-[10px] text-emerald-600">✓</span>
-                ) : (
-                  <span className="flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-ink-100 text-[10px] text-ink-400">·</span>
-                )}
-                <span className={done ? 'text-ink-700' : 'text-ink-400'}>{String(label)}</span>
-                {!done && <span className="text-[11px] text-ink-300">待开发</span>}
-              </div>
-            ))}
-          </div>
-        </div>
-      </div>
     </>
   );
 }
