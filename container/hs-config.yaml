@@ -31,10 +31,24 @@ database:
 
 # DERP 地图不能为空，否则 headscale 启动即 fatal
 derp:
+  # ⚠️ 联调环境的 DERP 策略（两个坑都实测踩过）：
+  #   1) 拉远程地图会让**启动依赖外网**：外网一抖就是
+  #      `getting DERPMap: TLS handshake timeout` → 容器起来又立刻退出。
+  #   2) 本地静态地图写 `regions: {}` 会被拒：
+  #      `initial DERPMap is empty, Headscale requires at least one entry`。
+  # ⇒ 改为启用**内置 DERP 服务器**：它自带一个 region，地图非空，
+  #    完全不依赖外网，且真的能提供中继能力。
+  #    若将来要接真实 Tailscale 客户端并走官方中继，把 urls 改回
+  #    `https://controlplane.tailscale.com/derpmap/default` 即可。
   server:
-    enabled: false
-  urls:
-    - https://controlplane.tailscale.com/derpmap/default
+    enabled: true
+    region_id: 999
+    region_code: lab
+    region_name: Lab Embedded DERP
+    stun_listen_addr: 0.0.0.0:3478
+    private_key_path: /var/lib/headscale/derp_server_private.key
+  urls: []
+  paths: []
   auto_update_enabled: false
 
 # 联调环境不查更新，避免无谓出网
@@ -59,6 +73,15 @@ dns:
       - 223.5.5.5
       - 119.29.29.29
     split: {}
+  # extra_records：写文件即热生效（fsnotify 监听 Create/Write/Chmod），无需重启。
+  # ⚠️ 与 inline 的 extra_records 互斥，同时配置会 fatal 退出。
+  # ⚠️ 只支持 A / AAAA 记录。
+  # 路径指向挂载目录内的文件，目录同时挂进面板容器由其写入。
+  # ⚠️ 路径**不能**放在 /var/lib/headscale 下面（实测踩过）：
+  #    该目录本身是挂载点，其下再挂子目录会被父挂载遮蔽 → fsnotify 监听到的是
+  #    一个不存在的路径，写文件毫无反应且**没有任何日志**（最难排查的一类）。
+  #    ⇒ 放到独立的 /dns 挂载点。
+  extra_records_path: /dns/extra-records.json
 
 log:
   level: debug

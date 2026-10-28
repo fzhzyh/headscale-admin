@@ -124,12 +124,37 @@ HS_IMAGE="$(resolve_hs_image)"
 ok "headscale 镜像：${HS_IMAGE}"
 
 # ---------------------------------------------------------------- 启动 headscale
+# ---------------------------------------------------------------- DNS extra-records 目录
+# headscale 用 fsnotify 监听 extra_records_path，写文件即热生效。
+# 该目录同时挂进面板容器（面板负责写入），headscale 负责读取。
+DNS_DIR="${STATE_DIR}/dns"
+DNS_FILE="${DNS_DIR}/extra-records.json"
+mkdir -p "${DNS_DIR}"
+# 首次创建空数组；刻意不用 `{}` 或空文件——headscale 会按非法 JSON 报错
+if [ ! -f "${DNS_FILE}" ]; then
+  printf '[]\n' > "${DNS_FILE}"
+  log "初始化 DNS extra-records 文件（空数组）"
+fi
+
+# ⚠️ 自愈：非法 JSON 会让 headscale **启动 fatal**
+#    （实测 `setting up extrarecord manager: unmarshalling records ... invalid character`，
+#     容器起来又立刻退出）。面板侧若写坏过一次文件，整个联调环境就再也起不来。
+#    这里在启动前校验，坏文件备份后重置为空数组——宁可丢几条记录，也不能把环境搞死。
+if ! python3 -c "import json,sys;json.load(open(sys.argv[1]))" "${DNS_FILE}" 2>/dev/null; then
+  BAD="${DNS_FILE}.invalid.$(date +%s)"
+  cp "${DNS_FILE}" "${BAD}" 2>/dev/null || true
+  printf '[]\n' > "${DNS_FILE}"
+  warn "DNS extra-records 文件不是合法 JSON，已备份到 $(basename "${BAD}") 并重置为空数组"
+fi
+chmod 644 "${DNS_FILE}"
+
 log "启动 headscale 容器 ${HS_CTR}"
 mkdir -p "${STATE_DIR}/hs"
 # ⚠️ 必须显式传 `serve`：官方镜像的 ENTRYPOINT 是 `headscale`，但没有默认 CMD，
 # 不带子命令时它会打印帮助并以 0 退出——容器"成功"启动又立刻停止，
 # 日志里只有一屏 help，极易误判成"启动失败但没报错"。
 container run -d --name "${HS_CTR}" --network "${NET}" \
+  -v "${DNS_DIR}:/dns" \
   -v "${CTR_DIR}/hs-config.yaml:/etc/headscale/config.yaml:ro" \
   -v "${STATE_DIR}/hs:/var/lib/headscale" \
   "${HS_IMAGE}" serve >/dev/null
@@ -294,6 +319,8 @@ mkdir -p "${STATE_DIR}/panel"
 # 而直连容器 IP 完全正常。容器 IP 每次重建可能变，下面「同步连接设置」会兜底。
 container run -d --name "${PANEL_CTR}" --network "${NET}" \
   -v "${STATE_DIR}/panel:/data" \
+  -v "${DNS_DIR}:/dns" \
+  -e DNS_EXTRA_RECORDS_PATH=/dns/extra-records.json \
   -e PANEL_HOST=0.0.0.0 \
   -e PANEL_PORT=3000 \
   -e PANEL_DATA_DIR=/data \

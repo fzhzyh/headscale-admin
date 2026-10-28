@@ -24,6 +24,7 @@ import {
   DisconnectOutlined,
   ApartmentOutlined,
   DatabaseOutlined,
+  GlobalOutlined,
 } from '@ant-design/icons';
 import { Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { useQueryClient } from '@tanstack/react-query';
@@ -52,6 +53,7 @@ const NAV: NavItem[] = [
   { key: '/routes', label: '路由管理', icon: <PartitionOutlined />, group: '网络', perms: ['route:read'] },
   { key: '/users', label: '网络用户', icon: <TeamOutlined />, group: '网络', perms: ['user:read'] },
   { key: '/acl', label: 'ACL 管理', icon: <SafetyCertificateOutlined />, group: '网络', perms: ['acl:read'] },
+  { key: '/dns', label: 'DNS 记录', icon: <GlobalOutlined />, group: '网络', perms: ['dns:read'] },
   { key: '/keys', label: '密钥管理', icon: <KeyOutlined />, group: '网络', perms: ['preauthkey:read', 'apikey:read'] },
   { key: '/connect', label: '快速连接', icon: <ApiOutlined />, group: '网络', perms: ['node:read'] },
   { key: '/panel-users', label: '面板账户', icon: <UserOutlined />, group: '治理', perms: ['paneluser:read', 'group:read'] },

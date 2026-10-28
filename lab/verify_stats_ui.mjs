@@ -212,6 +212,7 @@ check('流量项明确标注架构限制', bodyText.includes('设备流量统计
 check('网络拓扑标为已完成', bodyText.includes('网络拓扑可视化'));
 check('面板控制面指标标为已完成', bodyText.includes('面板控制面指标（API 吞吐/延迟/WS）'));
 check('资源中心标为已完成', bodyText.includes('资源中心（IP+端口 → ACL hosts 同步）'));
+check('DNS 记录标为已完成', bodyText.includes('DNS 额外记录（热加载）'));
 
 // ---------------------------------------------------------------- 控制台
 console.log('\n' + '='.repeat(88));

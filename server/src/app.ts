@@ -34,6 +34,7 @@ import { registerStatsRoutes } from './routes/stats.ts';
 import { recordRequest } from './services/metrics.ts';
 import { registerTopologyRoutes } from './routes/topology.ts';
 import { registerResourceRoutes } from './routes/resources.ts';
+import { registerDnsRoutes } from './routes/dns.ts';
 import { registerAiRoutes } from './routes/ai.ts';
 import { registerRealtimeRoutes } from './realtime/hub.ts';
 
@@ -173,6 +174,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   await registerStatsRoutes(app);
   await registerTopologyRoutes(app);
   await registerResourceRoutes(app);
+  await registerDnsRoutes(app);
   await registerAiRoutes(app);
   // WebSocket 实时推送（必须最后注册，避免与静态资源/SPA 回退冲突）
   await registerRealtimeRoutes(app);

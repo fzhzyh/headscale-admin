@@ -632,3 +632,58 @@ export interface ResourceSyncPreview {
     orphans: number;
   };
 }
+
+// ============================================================
+// DNS extra-records（P5）
+//
+// 硬约束（均实测确认）：
+//   · 只支持 A / AAAA
+//   · 非法 JSON 会让 headscale **启动失败**
+//   · 运行时重载静默（无日志、无查询接口）→「已写入」≠「已可解析」
+// ============================================================
+
+export interface DnsRecord {
+  id: number;
+  name: string;
+  type: string;
+  value: string;
+  comment: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface DnsListResponse {
+  records: DnsRecord[];
+  path: string;
+  stats: { total: number; a: number; aaaa: number };
+}
+
+export interface DnsStatus {
+  path: string;
+  exists: boolean;
+  /** 文件是否是可解析的 JSON 数组；false 时 headscale 重启会失败 */
+  valid: boolean;
+  error: string | null;
+  fileCount: number;
+  dbCount: number;
+  /** 文件与库不一致；valid=false 时为 null */
+  drift: boolean | null;
+  mtime: string | null;
+  /** 文件里有、面板库里没有的条目（手改痕迹） */
+  fileOnly: string[];
+  constraints: {
+    onlyAandAAAA: boolean;
+    hotReload: string;
+    invalidJsonIsFatal: string;
+    silentReload: string;
+  };
+}
+
+export interface DnsApplyResult {
+  ok: boolean;
+  path: string;
+  count: number;
+  /** 覆盖前文件里的条数 */
+  replaced: number;
+  note: string;
+}
