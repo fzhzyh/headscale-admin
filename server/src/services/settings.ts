@@ -84,9 +84,9 @@ export const SETTING_DEFS: SettingDef[] = [
   },
 
   // ---------- 时序库 ----------
-  { key: 'influx.url', label: 'InfluxDB 地址', group: 'influx', type: 'string', hint: '例如 http://influxdb:8086', default: '' },
-  { key: 'influx.org', label: 'InfluxDB Org', group: 'influx', type: 'string', default: 'headscale' },
-  { key: 'influx.bucket', label: 'InfluxDB Bucket', group: 'influx', type: 'string', default: 'headscale_admin' },
+  { key: 'influx.url', label: 'InfluxDB 地址', group: 'influx', type: 'string', hint: 'InfluxDB 3.x 的地址，默认端口 8181，例如 http://influxdb:8181', default: '' },
+  { key: 'influx.org', label: 'InfluxDB Org（3.x 已弃用）', group: 'influx', type: 'string', hint: '仅 InfluxDB 2.x 需要；3.x 没有 org 概念，此值不参与请求', default: 'headscale' },
+  { key: 'influx.bucket', label: 'InfluxDB 数据库名', group: 'influx', type: 'string', hint: '3.x 称 database。不存在时首次写入自动创建', default: 'headscale_admin' },
   { key: 'influx.token', label: 'InfluxDB Token', group: 'influx', type: 'string', secret: true, default: '' },
 
   // ---------- 采样 ----------

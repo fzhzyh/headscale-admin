@@ -2,15 +2,17 @@
  * 时序层单元测试（纯函数，不依赖 InfluxDB 实例）
  *
  * 覆盖的都是**实际踩过坑**的地方：
- *  1. pivot 后没有 _value 列 → 旧的过滤条件会把整张表滤空
- *  2. line protocol 转义：设备名带空格/逗号/等号会让整批写失败
- *  3. NaN/Infinity 写进 InfluxDB 会 400，必须替换
- *  4. 空 field 的行必须丢弃（InfluxDB 会拒整批）
+ *  1. 3.x 的 time **不带 Z** → new Date() 按本地时区解析，整体偏 8 小时
+ *  2. 3.x 的 json 响应是纯对象数组（不是 2.x 的 results/series 结构）
+ *  3. 查询失败返回纯文本，不能被当成数据
+ *  4. line protocol 转义：设备名带空格/逗号/等号会让整批写失败
+ *  5. NaN/Infinity 写进 InfluxDB 会 400，必须替换
+ *  6. 空 field 的行必须丢弃（InfluxDB 会拒整批）
  *
  * 运行：cd server && npx tsx src/timeseries/influx.test.ts
  */
 
-import { toLine, parseAnnotatedCsv } from './influx.ts';
+import { toLine, parseSqlJson, normalizeTime } from './influx.ts';
 import type { Point } from './influx.ts';
 
 let pass = 0;
@@ -33,55 +35,49 @@ function eq(name: string, actual: unknown, expected: unknown): void {
 }
 
 // ============================================================
-console.log('\n=== 1. annotated CSV 解析：普通查询（有 _value）===');
+console.log('\n=== 1. SQL JSON 解析：3.x 返回的是纯对象数组 ===');
 {
-  const csv = [
-    '#datatype,string,long,dateTime:RFC3339,double,string',
-    '#group,false,false,false,false,true',
-    '#default,_result,,,,',
-    ',result,table,_time,_value,_field',
-    ',_result,0,2026-10-27T18:40:00Z,1,online',
-    ',_result,0,2026-10-27T18:40:15Z,0,online',
-    '',
-  ].join('\n');
-  const rows = parseAnnotatedCsv(csv);
-  eq('解析出 2 行', rows.length, 2);
-  eq('第一行 _value', rows[0]?._value, '1');
-  eq('第二行 _time', rows[1]?._time, '2026-10-27T18:40:15Z');
+  // 实测响应（InfluxDB 3.12.1）：
+  //   [{"nodes_offline":2.0,"nodes_online":3.0,"time":"2026-10-28T18:00:53"}]
+  // 注意整数 field 也返回 float（5 → 5.0），JSON 解析后是 number 5
+  const body = '[{"nodes_offline":2.0,"nodes_online":3.0,"nodes_total":5.0,"online_ratio":0.6,"time":"2026-10-28T18:00:53"}]';
+  const { rows, error } = parseSqlJson(body);
+  eq('无错误', error, undefined);
+  eq('解析出 1 行', rows.length, 1);
+  eq('数值是 number 而非字符串', typeof rows[0]?.nodes_total, 'number');
+  eq('online_ratio 保留小数', rows[0]?.online_ratio, 0.6);
 }
 
-console.log('\n=== 2. annotated CSV 解析：pivot 后无 _value 列（回归用例）===');
+console.log('\n=== 2. ⚠️ time 缺时区必须补 Z（3.x 最易踩的坑）===');
 {
-  // pivot 会把每个 field 拆成独立列，此时不存在 _value。
-  // 旧实现「只保留有 _value 的行」会把整张表滤空 → 接口 0 点，
-  // 而 InfluxDB 里实际有数据（实测 count()=9，API 返回 0 点）。
-  const csv = [
-    '#datatype,string,long,dateTime:RFC3339,long,long,double,string,string',
-    '#group,false,false,false,false,false,false,true,true',
-    '#default,_result,,,,,,,',
-    ',result,table,_time,nodes_online,nodes_total,online_ratio,_measurement,scope',
-    ',_result,0,2026-10-27T18:40:00Z,0,4,0,cluster,global',
-    ',_result,0,2026-10-27T18:40:15Z,1,4,0.25,cluster,global',
-    '',
-  ].join('\n');
-  const rows = parseAnnotatedCsv(csv);
-  eq('pivot 行不被滤空', rows.length, 2);
-  eq('取到 nodes_total 列', rows[0]?.nodes_total, '4');
-  eq('取到 nodes_online 列', rows[1]?.nodes_online, '1');
-  eq('取到 online_ratio 列', rows[1]?.online_ratio, '0.25');
+  // 3.x 返回 "2026-10-28T18:00:53" —— 是 UTC 但没有 Z。
+  // new Date() 对无时区标识的 ISO 串按**本地时区**解析，
+  // 在 UTC+8 机器上会整体偏 8 小时，且不报任何错。
+  const naive = new Date('2026-10-28T18:00:53Z').getTime();
+  const { rows } = parseSqlJson('[{"time":"2026-10-28T18:00:53","v":1}]');
+  const got = new Date(String(rows[0]?.time)).getTime();
+  eq('补 Z 后时刻正确', got, naive);
+  eq('补出来的串带 Z', rows[0]?.time, '2026-10-28T18:00:53Z');
+
+  // 幂等：已带 Z / 带偏移的不应被二次修改
+  eq('已带 Z 不变', normalizeTime('2026-10-28T18:00:53Z'), '2026-10-28T18:00:53Z');
+  eq('带偏移不变', normalizeTime('2026-10-28T18:00:53+08:00'), '2026-10-28T18:00:53+08:00');
+  eq('带毫秒也能补', normalizeTime('2026-10-28T18:00:53.123'), '2026-10-28T18:00:53.123Z');
 }
 
-console.log('\n=== 3. annotated CSV 解析：空表 ===');
+console.log('\n=== 3. SQL JSON 解析：空与异常输入 ===');
 {
-  const csv = [
-    '#datatype,string,long,dateTime:RFC3339,double',
-    '#group,false,false,false,false',
-    '#default,_result,,,',
-    ',result,table,_time,_value',
-    '',
-  ].join('\n');
-  eq('空表返回 0 行', parseAnnotatedCsv(csv).length, 0);
-  eq('空字符串返回 0 行', parseAnnotatedCsv('').length, 0);
+  eq('空字符串 → 0 行', parseSqlJson('').rows.length, 0);
+  eq('纯空白 → 0 行', parseSqlJson('   ').rows.length, 0);
+  eq('空数组 → 0 行', parseSqlJson('[]').rows.length, 0);
+
+  // 3.x 查询失败时返回纯文本，不该被当成数据
+  const bad = parseSqlJson('Error during planning: table \'public.iox.x\' not found');
+  eq('纯文本不当成数据', bad.rows.length, 0);
+  eq('纯文本给出 error', typeof bad.error, 'string');
+
+  const notArr = parseSqlJson('{"results":[]}');
+  eq('对象不是数组 → error', typeof notArr.error, 'string');
 }
 
 console.log('\n=== 4. line protocol：基本格式 ===');

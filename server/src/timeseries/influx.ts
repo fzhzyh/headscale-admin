@@ -1,25 +1,34 @@
 /**
- * InfluxDB 2.x 写入层（line protocol，无 SDK 依赖）
+ * InfluxDB 3.x 写入与查询层（line protocol + SQL，无 SDK 依赖）
  *
- * 设计取舍：
- * ─────────────────────────────────────────────────────────────
- * 1. **不用 @influxdata/influxdb-client**
- *    写入 API 就是 `POST /api/v2/write?org=&bucket=&precision=s` + 一行行
- *    `measurement,tag=v field=1 ts`。自己发 fetch 约 60 行，换来：
- *      · 少一个依赖（该 SDK 会连带 vendor 一堆浏览器侧 polyfill）
- *      · 无供应链风险，Node 22 自带 fetch，零额外安装
- *      · 出错时的报文能原样打日志，不像 SDK 包一层自定义 Error
- *    代价：没有自动重试/背压。这里用「批量 + 失败丢弃 + 计数」覆盖，
- *    因为这些是监控数据，丢几个点远好过拖垮采样器。
+ * ## 为什么是 3.x 而不是 2.x
  *
- * 2. **写失败绝不抛到调用方**
- *    采样器跑在定时器里，一次写入异常若冒泡就会中断整个轮询链，
- *    连带把 WebSocket 推送也带停。所以写路径全部 try/catch，
- *    失败只累加计数器并 warn（带节流），下个周期继续。
+ * 2.x 的 Flux 查询语言在 3.x 已被移除，官方明确新负载走 SQL。两者 API
+ * 完全不同，无法含糊兼容：
  *
- * 3. **批量而非逐点**
- *    15s 采一次、N 台设备 → 每轮 N+1 个点。攒够 FLUSH_MAX 或超过
- *    FLUSH_MS 就一次性发，减少 HTTP 往返。
+ * | | 2.x | 3.x |
+ * |---|---|---|
+ * | 写入 | `POST /api/v2/write?org=&bucket=&precision=s` | `POST /api/v3/write_lp?db=&precision=second` |
+ * | 查询 | `POST /api/v2/query?org=` + Flux → annotated CSV | `POST /api/v3/query_sql` + JSON → **纯数组** |
+ * | 身份 | org + bucket | database（无 org 概念） |
+ * | 建库 | 需预先创建 bucket | **首次写入自动创建** |
+ * | 健康 | `/api/v2/buckets` | `/health`（**需 token**，返回纯文本 `OK`） |
+ *
+ * 配置层保留 `INFLUX_ORG` 只为兼容旧 .env，3.x 下不参与任何请求。
+ * `INFLUX_BUCKET` 直接作为 3.x 的 database 名。
+ *
+ * ## 设计取舍
+ *
+ * 1. **不用官方 SDK**：写入就是「一行行 line protocol 发个 POST」，查询就是
+ *    「发个 JSON 拿回 JSON 数组」。自己发 fetch 约 80 行，换来少一个依赖、
+ *    无供应链风险、出错报文能原样进日志。
+ *
+ * 2. **写失败绝不抛到调用方**：采样器跑在定时器里，一次写入异常若冒泡就会
+ *    中断整个轮询链，连带把 WebSocket 推送也带停。写路径全部 try/catch，
+ *    失败只累加计数并记录最后错误（节流后 warn），下个周期继续。这是监控
+ *    数据，丢几个点远好过拖垮采样器。
+ *
+ * 3. **time 字段统一补时区**：见 normalizeTime —— 这是 3.x 最容易踩的坑。
  */
 
 import { loadConfig } from '../config.ts';
@@ -50,6 +59,7 @@ function cfgInflux(): { url: string; org: string; bucket: string; token: string 
 /** 是否已配置 InfluxDB（未配置时采样器降级：只算内存快照，不写库） */
 export function influxEnabled(): boolean {
   const c = cfgInflux();
+  // 3.x 不需要 org，只看 url / token / database
   return Boolean(c.url && c.token && c.bucket);
 }
 
@@ -126,17 +136,20 @@ async function postBatch(lines: string[]): Promise<boolean> {
   if (lines.length === 0) return true;
   const c = cfgInflux();
 
-  const url = `${c.url}/api/v2/write?org=${encodeURIComponent(c.org)}&bucket=${encodeURIComponent(c.bucket)}&precision=s`;
+  // 3.x 原生写入端点。db 不存在时会自动创建（实测确认，无需预建库）。
+  // precision 用 3.x 的枚举名 `second`，不是 2.x 的 `s`。
+  const url = `${c.url}/api/v3/write_lp?db=${encodeURIComponent(c.bucket)}&precision=second`;
   try {
     const res = await fetch(url, {
       method: 'POST',
       headers: {
-        Authorization: `Token ${c.token}`,
+        Authorization: `Bearer ${c.token}`,
         'Content-Type': 'text/plain; charset=utf-8',
       },
       body: lines.join('\n'),
       signal: AbortSignal.timeout(5000),
     });
+    // 成功返回 204 No Content
     if (!res.ok) {
       const body = await res.text().catch(() => '');
       lastErrorAt = Date.now();
@@ -178,95 +191,126 @@ export function writeStats(): WriteStats {
 }
 
 /**
- * 连通性自检：查 /api/v2/buckets 而不是写一个假点。
- * 写假点会污染真实数据，且在只读 token 下会误判为「不可用」。
+ * 连通性自检：打 3.x 的 `/health`（带 token）。
+ *
+ * ⚠️ 3.x 的 `/health` **需要认证**，不带 token 返回 401
+ * `{"error":"the request was not authenticated"}`；带对了返回**纯文本 `OK`**
+ * （不是 JSON）。所以这里不能按 JSON 解析。
+ *
+ * 不用「写一个假点」来探测：会污染真实数据，且在只读 token 下会误判为不可用。
  */
 export async function influxHealth(): Promise<{ ok: boolean; detail: string }> {
   const c = cfgInflux();
   if (!influxEnabled()) return { ok: false, detail: '未配置 INFLUX_URL / INFLUX_TOKEN' };
   try {
-    const res = await fetch(`${c.url}/api/v2/buckets?limit=1`, {
-      headers: { Authorization: `Token ${c.token}` },
+    const res = await fetch(`${c.url}/health`, {
+      headers: { Authorization: `Bearer ${c.token}` },
       signal: AbortSignal.timeout(4000),
     });
-    if (res.ok) return { ok: true, detail: `bucket=${c.bucket}` };
-    const body = await res.text().catch(() => '');
+    const body = (await res.text().catch(() => '')).trim();
+    if (res.ok) return { ok: true, detail: `InfluxDB 3 · ${body || 'OK'} · db=${c.bucket}` };
     return { ok: false, detail: `HTTP ${res.status} ${body.slice(0, 200)}` };
   } catch (err) {
     return { ok: false, detail: err instanceof Error ? err.message : String(err) };
   }
 }
 
-/**
- * 执行一条 Flux 查询，返回「列名 → 值」的行数组。
- *
- * 为什么要自己解析 CSV：InfluxDB 返回的是 **annotated CSV**（前面若干行
- * `#datatype`/`#group`/`#default` 元数据，然后才是表头与数据），按行 split
- * 会得到一堆噪音。这里只取 `,result,table,...` 之后的第一张表，
- * 足够覆盖本项目的查询（单 measurement、单 field 或少量 field）。
- *
- * 设计取舍：不引 @influxdata/influxdb-client 的 queryApi —— 它把 CSV 解析
- * 封得很深，出错时看不到原始响应；而面板只需要"取几条曲线"，自己解析
- * 反而更透明、可调试。
- */
-export interface FluxRow {
-  [column: string]: string;
+/** SQL 查询返回的一行：列名 → 值 */
+export interface SqlRow {
+  [column: string]: string | number | boolean | null;
 }
 
-export async function queryFlux(flux: string, signalMs = 8000): Promise<{ rows: FluxRow[]; error?: string }> {
+/**
+ * 把 InfluxDB 3 返回的时间字符串补上时区标识。
+ *
+ * ## 为什么必须做
+ * 3.x 返回的 `time` 形如 `"2026-10-28T18:00:53"` —— **是 UTC，但没有 `Z`**。
+ * 而 `new Date("2026-10-28T18:00:53")` 对这个「无时区标识的 ISO 串」会按
+ * **本地时区**解析（ECMA-262 date-time 规则）。在 UTC+8 的机器上直接算，
+ * 每个点的时间会偏 8 小时，图表整体错位，而且不报任何错。
+ *
+ * 实测：服务器本地时区 CST(+8)，写入 ts=1793210453（=18:00:53Z），
+ * 接口原样返回 `"2026-10-28T18:00:53"`，`new Date()` 会当成
+ * `18:00:53+08:00`，比真实时刻晚 8 小时。
+ *
+ * 这里统一补 `Z`。已有 `Z` 或带 `+08:00` 之类偏移的串原样返回（幂等）。
+ */
+export function normalizeTime(v: unknown): unknown {
+  if (typeof v !== 'string') return v;
+  return /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?$/.test(v) ? `${v}Z` : v;
+}
+
+/**
+ * 解析 `/api/v3/query_sql?format=json` 的响应体。
+ *
+ * 3.x 在 json 格式下直接返回**对象数组**（不是 2.x 的
+ * `{results:[{series:{columns,values}}]}`），所以不需要列/值矩阵映射。
+ * 抽成纯函数是为了能脱离网络做单元测试。
+ *
+ * `time` 经 normalizeTime 补时区；非数组/非法 JSON 返回 error 而不抛。
+ */
+export function parseSqlJson(text: string): { rows: SqlRow[]; error?: string } {
+  const t = text.trim();
+  if (!t) return { rows: [] };
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(t);
+  } catch {
+    return { rows: [], error: `返回不是合法 JSON: ${t.slice(0, 200)}` };
+  }
+  if (!Array.isArray(parsed)) {
+    // 3.x 出错时返回纯文本（如 `Error during planning: table ... not found`），
+    // 被上游当成功响应处理时会走到这里，保留下原文便于定位。
+    return { rows: [], error: `返回不是数组: ${t.slice(0, 200)}` };
+  }
+
+  const rows: SqlRow[] = [];
+  for (const item of parsed) {
+    if (!item || typeof item !== 'object') continue;
+    const row = item as SqlRow;
+    if ('time' in row) row.time = normalizeTime(row.time) as string;
+    rows.push(row);
+  }
+  return { rows };
+}
+
+/**
+ * 执行一条 SQL，返回「列名 → 值」的行数组。
+ *
+ * `time` 字段统一经 normalizeTime 补时区（见该函数注释）。
+ */
+export async function querySql(
+  sql: string,
+  signalMs = 8000,
+): Promise<{ rows: SqlRow[]; error?: string }> {
   const c = cfgInflux();
   if (!influxEnabled()) return { rows: [], error: '未配置 InfluxDB' };
   try {
-    const res = await fetch(`${c.url}/api/v2/query?org=${encodeURIComponent(c.org)}`, {
+    const res = await fetch(`${c.url}/api/v3/query_sql`, {
       method: 'POST',
       headers: {
-        Authorization: `Token ${c.token}`,
-        'Content-Type': 'application/vnd.flux',
-        Accept: 'application/csv',
+        Authorization: `Bearer ${c.token}`,
+        'Content-Type': 'application/json',
       },
-      body: flux,
+      body: JSON.stringify({ db: c.bucket, q: sql, format: 'json' }),
       signal: AbortSignal.timeout(signalMs),
     });
-    const text = await res.text();
-    if (!res.ok) return { rows: [], error: `HTTP ${res.status} ${text.slice(0, 300)}` };
-    return { rows: parseAnnotatedCsv(text) };
+    const text = (await res.text()).trim();
+
+    if (!res.ok) {
+      const msg = text.slice(0, 300);
+      // 「表不存在」= 还没有任何采样写入过（首次部署的正常空态），不是故障。
+      // 若当成错误上报，用户第一次打开面板会看到红色故障提示。
+      // 实测报文：Error during planning: table 'public.iox.node_status' not found
+      if (/not found|does not exist/i.test(msg)) return { rows: [] };
+      return { rows: [], error: `HTTP ${res.status} ${msg}` };
+    }
+
+    return parseSqlJson(text);
   } catch (err) {
     return { rows: [], error: err instanceof Error ? err.message : String(err) };
   }
-}
-
-/** 解析 annotated CSV：跳过 # 开头的元数据行，取表头后的数据行 */
-export function parseAnnotatedCsv(text: string): FluxRow[] {
-  const lines = text.split(/\r?\n/);
-  let header: string[] | null = null;
-  let hasValueCol = false;
-  const rows: FluxRow[] = [];
-  for (const line of lines) {
-    if (!line) continue;
-    if (line.startsWith('#')) continue;
-    const cells = line.split(',');
-    // 表头行形如 ",result,table,_start,..."——首列是空的分组键
-    if (header === null) {
-      header = cells;
-      // ⚠️ 只有未 pivot 的查询才有 _value 列。
-      // pivot(rowKey,columnKey,valueColumn) 会把 field 拆成独立列，
-      // 此时若仍按「必须有 _value」过滤，整张表会被滤空 → 接口返回 0 点，
-      // 而 InfluxDB 里其实有数据（实测踩过：count() 有 9 条，API 返回 0 点）。
-      hasValueCol = cells.includes('_value');
-      continue;
-    }
-    // result 为空表示这张表结束（InfluxDB 用空行+新表头分隔）
-    if (cells.length < header.length) continue;
-    const row: FluxRow = {};
-    for (let i = 0; i < header.length; i += 1) {
-      const key = header[i] || `_col${i}`;
-      row[key] = cells[i] ?? '';
-    }
-    // 未 pivot 时只保留带 _value 的数据行；pivot 后保留全部
-    if (hasValueCol && (row._value === undefined || row._value === '')) continue;
-    rows.push(row);
-  }
-  return rows;
 }
 
 /** 测试用：清空计数与缓冲 */

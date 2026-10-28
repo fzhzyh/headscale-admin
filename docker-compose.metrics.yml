@@ -1,4 +1,4 @@
-# 可选组件：InfluxDB 时序库（用于在线时长与趋势曲线）
+# 可选组件：InfluxDB 3.x 时序库（用于在线时长与趋势曲线）
 #
 # ## 为什么单独一个文件
 #
@@ -6,17 +6,15 @@
 # `${VAR:?}` 的求值。把 influxdb 放在主文件里，实测表现为：
 #
 #     $ docker compose up -d headscale
-#     error while interpolating services.influxdb.environment.
-#     DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: required variable INFLUX_TOKEN is missing
-#     → 退出码 1，连 headscale 都没起
+#     error while interpolating services.influxdb.environment...
+#     required variable INFLUX_TOKEN is missing → 退出码 1
 #
-# 也就是说：只想跑核心服务，却被可选组件的必填校验挡住。
-# 拆分 overlay 后，主文件只管真正的必需项，可选组件的校验只在
-# 你真的要用它时才生效。
+# 也就是：只想跑核心服务，却被可选组件的必填校验挡住。
+# 拆分 overlay 后，主文件只管真正的必需项。
 #
 # ## 用法
 #
-#   # 启用（三个变量必须先填好，缺了会在此刻报错，符合预期）
+#   # 启用
 #   docker compose -f docker-compose.yml -f docker-compose.metrics.yml \
 #                  --profile metrics up -d
 #
@@ -24,49 +22,91 @@
 #   docker compose -f docker-compose.yml -f docker-compose.metrics.yml \
 #                  --profile metrics up -d influxdb
 #
-#   # 停掉并保留数据
-#   docker compose -f docker-compose.yml -f docker-compose.metrics.yml \
-#                  --profile metrics stop influxdb
+# ## 3.x 与 2.x 的差异（决定了下面的写法）
 #
-# ## 面板侧如何接上
-# 在 .env 里补 `INFLUX_URL=http://influxdb:8086`（面板与 influx 都在
-# hs-net 网络内，用服务名即可）。INFLUX_ORG / INFLUX_BUCKET / INFLUX_TOKEN
-# 要与下面 DOCKER_INFLUXDB_INIT_* 保持一致。
+# | | 2.x | 3.x（本文件） |
+# |---|---|---|
+# | 镜像 | influxdb:2.7-alpine | influxdb:3.12.1-core |
+# | 端口 | 8086 | **8181** |
+# | 初始化 | `DOCKER_INFLUXDB_INIT_*` 环境变量自动 setup | **无自动初始化**，需先建 admin token |
+# | 身份 | org + bucket | **database**（无 org 概念） |
+# | 建库 | 随 setup 建 bucket | **首次写入自动创建**，无需预建 |
+#
+# ## 首次初始化（唯一需要手工的一步）
+#
+# InfluxDB 3 Core 没有 2.x 那套 INIT 环境变量，admin token 必须显式创建。
+# 这是一次性操作，之后 token 写进 .env 长期使用：
+#
+#     # 1. 起时序库
+#     docker compose -f docker-compose.yml -f docker-compose.metrics.yml \
+#                    --profile metrics up -d influxdb
+#
+#     # 2. 创建 admin token（首次可用、无需认证；取返回 JSON 的 token 字段）
+#     curl -X POST http://127.0.0.1:8086/api/v3/configure/token/admin
+#
+#     # 3. 把 token 填进 .env：
+#     #    INFLUX_URL=http://influxdb:8181
+#     #    INFLUX_TOKEN=apiv3_xxxxx...
+#     #    INFLUX_BUCKET=headscale_admin      # 3.x 的 database 名，不存在会自动建
+#
+#     # 4. 重启面板让它读到新配置
+#     docker compose up -d panel
+#
+# 想全自动也行：把第 2 步放进初始化脚本，用 `jq -r .token` 取出再写入 .env。
+# 这里**不内置自动初始化容器** —— token 是生产密钥，让它静默生成并落在某个
+# 共享卷里，比「人看着填一次」更容易出事。
 
 services:
   influxdb:
-    image: ${INFLUX_IMAGE:-influxdb:2.7-alpine}
+    # 固定到具体补丁版本，不用 3-core / latest 这类浮动 tag：
+    # 时序库跨小版本可能有 schema/行为变化，生产要可复现。
+    image: ${INFLUX_IMAGE:-influxdb:3.12.1-core}
     container_name: headscale-influx
     restart: unless-stopped
     profiles: ["metrics"]
 
-    # ⚠️ 必须用非 root：官方 entrypoint 在 root 下会 chown 数据目录，
-    # 某些挂载类型（virtiofs 等）不允许 chown → 容器直接退出，
-    # 日志只有两行 chmod/chown 报错。非 root 会跳过该分支。
-    user: influxdb
+    # ⚠️ 官方镜像**已经以非 root（uid 1500，用户 influxdb3）运行**，
+    # 不要再写 `user:` 覆盖，否则 entrypoint 找不到家目录会失败。
+    # （2.x 时代需要显式 user: influxdb，3.x 不需要 —— 这点容易照抄出错。）
+
+    # ⚠️ 数据目录必须挂**命名卷**到 /var/lib/influxdb3：
+    # 实测踩过 —— 用 bind mount 挂宿主目录时宿主目录属主是 root，
+    # 容器内 uid 1500 无法建子目录：
+    #   Serve command failed: failed to initialize catalog: object store error:
+    #   UnableToCreateDir { code: 13, PermissionDenied,
+    #   path: "/var/lib/influxdb3/data/node1/catalog/v3" }
+    # 命名卷首次创建会继承镜像内该路径的属主（influxdb3:influxdb3），不会踩坑。
+    volumes:
+      - influx-data:/var/lib/influxdb3
 
     environment:
-      DOCKER_INFLUXDB_INIT_MODE: setup
-      DOCKER_INFLUXDB_INIT_USERNAME: ${INFLUX_ADMIN_USER:-admin}
-      DOCKER_INFLUXDB_INIT_PASSWORD: ${INFLUX_ADMIN_PASSWORD:?启用 metrics 时必须设置 INFLUX_ADMIN_PASSWORD（openssl rand -base64 24）}
-      DOCKER_INFLUXDB_INIT_ORG: ${INFLUX_ORG:-headscale}
-      DOCKER_INFLUXDB_INIT_BUCKET: ${INFLUX_BUCKET:-headscale_admin}
-      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: ${INFLUX_TOKEN:?启用 metrics 时必须设置 INFLUX_TOKEN（openssl rand -hex 32）}
-      DOCKER_INFLUXDB_INIT_RETENTION: 90d
+      # serve 的两个必需参数（缺任一直接报 usage 错）
+      INFLUXDB3_NODE_ID: ${INFLUX_NODE_ID:-node1}
+      INFLUXDB3_OBJECT_STORE: file
+      INFLUXDB3_DATA_DIR: /var/lib/influxdb3/data
       TZ: ${TZ:-Asia/Shanghai}
 
-    volumes:
-      - influx-data:/var/lib/influxdb2
-      - influx-etc:/etc/influxdb2
-
     ports:
-      - "${INFLUX_BIND:-127.0.0.1}:${INFLUX_PORT:-8086}:8086"
+      # 3.x 的 HTTP 端口是 8181（不是 2.x 的 8086）。
+      # 宿主侧仍默认映射 8086，便于沿用旧习惯；容器内固定 8181。
+      - "${INFLUX_BIND:-127.0.0.1}:${INFLUX_PORT:-8086}:8181"
 
     networks:
       - hs-net
 
     healthcheck:
-      test: ["CMD", "influxdb", "health"]
+      # ⚠️ 两个坑叠在一起，才写成这样：
+      #
+      # 1. 镜像里**没有 wget**，只有 curl 和 bash。用 wget 会 exit 127 →
+      #    容器永远 unhealthy（实测踩过）。
+      # 2. 3.x 的 /health **需要认证**，不带 token 返回 401。
+      #    所以不能用 `curl -f`（遇 4xx 返回 22），只能不带 -f：
+      #    连接成功就 exit 0，无论 200 还是 401。
+      #
+      # 这样探的是「HTTP 端口在监听」，不做认证检查 —— 因为 token 在首次
+      # 初始化前还不存在，用 token 探活会让容器卡在 unhealthy，
+      # 反而拖住 depends_on 链。认证是否正确由面板的「时序库」卡片自检呈现。
+      test: ["CMD-SHELL", "curl -s -o /dev/null http://127.0.0.1:8181/health || exit 1"]
       interval: 15s
       timeout: 5s
       start_period: 20s
@@ -80,4 +120,3 @@ services:
 
 volumes:
   influx-data:
-  influx-etc:

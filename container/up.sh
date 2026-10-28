@@ -27,10 +27,11 @@ PANEL_CTR="${PANEL_CONTAINER:-hs-panel}"
 INFLUX_CTR="${INFLUX_CONTAINER:-hs-influx}"
 HS_IMAGE_DEFAULT="${HS_IMAGE:-ghcr.io/juanfont/headscale:v0.29.6}"
 PANEL_IMAGE="${PANEL_IMAGE:-headscale-admin-panel:dev}"
-INFLUX_IMAGE="${INFLUX_IMAGE:-docker.m.daocloud.io/library/influxdb:2.7-alpine}"
+INFLUX_IMAGE="${INFLUX_IMAGE:-docker.m.daocloud.io/library/influxdb:3.12.1-core}"
 PUB_IP="${PUBLIC_IP:-100.64.0.3}"
 
 # InfluxDB 组织/桶（时序数据落这里）
+# 3.x 已无 org 概念；保留变量只为兼容旧 .env，不再注入容器
 INFLUX_ORG="${INFLUX_ORG_NAME:-headscale}"
 INFLUX_BUCKET="${INFLUX_BUCKET_NAME:-headscale_admin}"
 
@@ -164,13 +165,23 @@ log "等待 headscale 就绪"
 # 官方镜像里没有 wget/curl（实测 `wget: not found`），容器内探活会永远失败，
 # 而实际服务早就起来了——这种"假失败"最浪费时间。
 ctr_ip() { container list --all 2>/dev/null | awk -v n="$1" '$1==n {print $6}' | cut -d/ -f1; }
+# wait_http <容器名> <端口> <路径> [次数] [期望状态码|any]
+#
+# accept=any 表示「只要 TCP 通了、拿到了任意 HTTP 响应就算就绪」。
+# 这是给 InfluxDB 3.x 用的：它的 /health **需要认证**，无 token 时返回 401，
+# 若仍按 200 判就绪会永远等不到。
 wait_http() {
-  local name="$1" port="$2" path="$3" limit="${4:-60}" ip="" code=""
+  local name="$1" port="$2" path="$3" limit="${4:-60}" accept="${5:-200}"
+  local ip="" code=""
   for _ in $(seq 1 "$limit"); do
     ip="$(ctr_ip "$name")"
     if [ -n "$ip" ]; then
       code="$(curl -sS --noproxy '*' -m 2 -o /dev/null -w '%{http_code}' "http://${ip}:${port}${path}" 2>/dev/null || echo 000)"
-      [ "$code" = "200" ] && { echo "$ip"; return 0; }
+      if [ "$accept" = "any" ]; then
+        [ "$code" != "000" ] && { echo "$ip"; return 0; }
+      else
+        [ "$code" = "$accept" ] && { echo "$ip"; return 0; }
+      fi
     fi
     sleep 2
   done
@@ -191,13 +202,7 @@ if [ ! -f "${ENV_FILE}" ]; then
 PANEL_MASTER_KEY=$(openssl rand -hex 32)
 PANEL_SESSION_SECRET=$(openssl rand -hex 32)
 PANEL_ADMIN_SECRET=$(openssl rand -base64 18 | tr -d '/+=' | head -c 20)
-INFLUX_ADMIN_SECRET=$(openssl rand -base64 18 | tr -d '/+=' | head -c 20)
 EOF
-  chmod 600 "${ENV_FILE}"
-fi
-# 老版本 lab.env 没有 InfluxDB 口令：补齐（不重播种，避免把已有面板口令冲掉）
-if ! grep -q '^INFLUX_ADMIN_SECRET=' "${ENV_FILE}" 2>/dev/null; then
-  printf 'INFLUX_ADMIN_SECRET=%s\n' "$(openssl rand -base64 18 | tr -d '/+=' | head -c 20)" >> "${ENV_FILE}"
   chmod 600 "${ENV_FILE}"
 fi
 # shellcheck disable=SC1090
@@ -242,35 +247,74 @@ if ! container image list 2>/dev/null | grep -q "influxdb"; then
      container image pull --platform ${CTR_PLATFORM} ${INFLUX_IMAGE}"
 fi
 
-log "启动 InfluxDB 容器 ${INFLUX_CTR}"
-mkdir -p "${STATE_DIR}/influx" "${STATE_DIR}/influx-etc"
-# ⚠️ --user influxdb 不是随便加的，两个原因缺一不可：
-#   1) /entrypoint.sh 里的 chown/chmod 只在 id -u == 0 时执行，而 Apple container
-#      的 virtiofs 挂载**不允许 chown**（实测 `chown: /var/lib/influxdb2:
-#      Operation not permitted` → 容器直接退出，日志只有两行 chmod/chown 报错）。
-#      降为非 root 即跳过该分支。
-#   2) 实测非 root（uid=1000 influxdb）对挂载卷是**可写**的，所以降权不牺牲持久化。
-# 另挂 /etc/influxdb2：INIT_MODE=setup 会写 config.yml，镜像层对非 root 只读。
+log "启动 InfluxDB 3.x 容器 ${INFLUX_CTR}"
+mkdir -p "${STATE_DIR}/influx"
+# ⚠️ 3.x 的数据目录是 /var/lib/influxdb3（2.x 是 /var/lib/influxdb2），
+#    且镜像**已经以非 root（uid 1500 influxdb3）运行**，不能再加 --user 覆盖。
+#
+# ⚠️ bind mount 的属主放开到 777：宿主目录属主是当前用户（501），容器内是
+#    uid 1500，不放开会：
+#      Serve command failed: failed to initialize catalog: object store error:
+#      UnableToCreateDir { code: 13, PermissionDenied,
+#      path: "/var/lib/influxdb3/data/node1/catalog/v3" }
+#    Apple container 不能用 Docker 那种「命名卷继承镜像属主」的办法，所以这里
+#    退而用宽松权限 —— 仅本机联调环境，生产 compose 走命名卷不需要这一步。
+chmod 777 "${STATE_DIR}/influx" 2>/dev/null || true
 container run -d --name "${INFLUX_CTR}" --network "${NET}" \
-  --user influxdb \
-  -v "${STATE_DIR}/influx:/var/lib/influxdb2" \
-  -v "${STATE_DIR}/influx-etc:/etc/influxdb2" \
-  -e DOCKER_INFLUXDB_INIT_MODE=setup \
-  -e DOCKER_INFLUXDB_INIT_USERNAME=admin \
-  -e DOCKER_INFLUXDB_INIT_PASSWORD="${INFLUX_ADMIN_SECRET}" \
-  -e DOCKER_INFLUXDB_INIT_ORG="${INFLUX_ORG}" \
-  -e DOCKER_INFLUXDB_INIT_BUCKET="${INFLUX_BUCKET}" \
-  -e DOCKER_INFLUXDB_INIT_ADMIN_TOKEN="${INFLUX_TOKEN}" \
-  -e DOCKER_INFLUXDB_INIT_RETENTION=90d \
+  -v "${STATE_DIR}/influx:/var/lib/influxdb3" \
+  -e INFLUXDB3_NODE_ID=labnode \
+  -e INFLUXDB3_OBJECT_STORE=file \
+  -e INFLUXDB3_DATA_DIR=/var/lib/influxdb3/data \
   "${INFLUX_IMAGE}" >/dev/null
 
 log "等待 InfluxDB 就绪"
-INFLUX_IP="$(wait_http "${INFLUX_CTR}" 8086 /health 60)" || {
+# accept=any：3.x 的 /health 需要认证，无 token 返回 401，不能按 200 判
+INFLUX_IP="$(wait_http "${INFLUX_CTR}" 8181 /health 60 any)" || {
   echo "---- InfluxDB 日志 ----" >&2
   container logs "${INFLUX_CTR}" 2>&1 | tail -30 >&2
   die "InfluxDB 未在 120s 内就绪"
 }
-ok "InfluxDB 已就绪（${INFLUX_IP}:8086，org=${INFLUX_ORG} bucket=${INFLUX_BUCKET}）"
+
+# ---------------------------------------------------------------- admin token
+#
+# 3.x 没有 2.x 那套 DOCKER_INFLUXDB_INIT_ADMIN_TOKEN —— token 必须在容器起来
+# 之后显式创建，且**只有首次（库里还没有任何 token 时）可以无认证创建**。
+#
+# 所以这里分三种情况：
+#   a) 文件里有 token 且实测可用      → 直接用
+#   b) 文件里有 token 但被拒（401/403）→ 数据卷被重建过，旧 token 失效 → 重建
+#   c) 文件不存在                      → 首次创建
+influx_probe() {
+  local tk="$1"
+  [ -n "$tk" ] || return 1
+  [ "$(curl -sS --noproxy '*' -m 3 -o /dev/null -w '%{http_code}' \
+        -H "Authorization: Bearer ${tk}" "http://${INFLUX_IP}:8181/health" 2>/dev/null)" = "200" ]
+}
+create_admin_token() {
+  curl -sS --noproxy '*' -m 8 -X POST "http://${INFLUX_IP}:8181/api/v3/configure/token/admin" 2>/dev/null \
+    | sed -n 's/.*"token":"\([^"]*\)".*/\1/p'
+}
+
+INFLUX_TOKEN="$(tr -d '[:space:]' < "${INFLUX_TOKEN_FILE}" 2>/dev/null || true)"
+
+if influx_probe "${INFLUX_TOKEN}"; then
+  log "InfluxDB token 有效（沿用 ${INFLUX_TOKEN_FILE}）"
+else
+  [ -n "${INFLUX_TOKEN}" ] && log "旧 token 已失效（数据卷可能被重建），重新创建"
+  NEW_TOKEN="$(create_admin_token)"
+  if [ -z "${NEW_TOKEN}" ]; then
+    echo "---- InfluxDB 日志 ----" >&2
+    container logs "${INFLUX_CTR}" 2>&1 | tail -20 >&2
+    die "创建 InfluxDB admin token 失败（接口无 token 返回，可能是容器内已有其他 token）"
+  fi
+  printf '%s' "${NEW_TOKEN}" > "${INFLUX_TOKEN_FILE}"
+  chmod 600 "${INFLUX_TOKEN_FILE}"
+  INFLUX_TOKEN="${NEW_TOKEN}"
+  influx_probe "${INFLUX_TOKEN}" || die "新创建的 InfluxDB token 仍不可用，检查 /health 认证"
+  ok "已创建 InfluxDB admin token"
+fi
+
+ok "InfluxDB 已就绪（${INFLUX_IP}:8181，database=${INFLUX_BUCKET}）"
 
 # ---------------------------------------------------------------- 构建并启动面板
 # 先把 Dockerfile 的 FROM 基础镜像拉到本地，再构建。
@@ -335,8 +379,7 @@ container run -d --name "${PANEL_CTR}" --network "${NET}" \
   -e HS_TRANSPORT=rest \
   -e LOGIN_RATE_MAX="${LOGIN_RATE_MAX_LAB:-300}" \
   -e LOGIN_RATE_WINDOW_SEC=300 \
-  -e INFLUX_URL="http://${INFLUX_IP}:8086" \
-  -e INFLUX_ORG="${INFLUX_ORG}" \
+  -e INFLUX_URL="http://${INFLUX_IP}:8181" \
   -e INFLUX_BUCKET="${INFLUX_BUCKET}" \
   -e INFLUX_TOKEN="${INFLUX_TOKEN}" \
   "${PANEL_IMAGE}" >/dev/null
@@ -411,7 +454,7 @@ nohup python3 "${ROOT}/lab/hostport.py" \
   "${HS_PUB_PORT}=${HS_IP}:8080" \
   "${METRICS_PUB_PORT}=${HS_IP}:9090" \
   "${GRPC_PUB_PORT}=${HS_IP}:50443" \
-  "${INFLUX_PUB_PORT}=${INFLUX_IP}:8086" \
+  "${INFLUX_PUB_PORT}=${INFLUX_IP}:8181" \
   > "${STATE_DIR}/hostport.log" 2>&1 &
 echo $! > "${PID_FILE}"
 sleep 2

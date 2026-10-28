@@ -20,20 +20,14 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { requirePermission } from '../auth/guard.ts';
-import { loadConfig } from '../config.ts';
-import { influxHealth, queryFlux, writeStats } from '../timeseries/influx.ts';
+import { influxHealth, querySql, writeStats } from '../timeseries/influx.ts';
 import { samplerStats } from '../timeseries/sampler.ts';
 import { panelMetrics } from '../services/metrics.ts';
 import { pushCounters, wsClientCount } from '../realtime/hub.ts';
 
-/** 桶名从配置读，避免硬编码 */
-function bucket(): string {
-  return loadConfig().influx.bucket;
-}
-
-/** 把 Flux 返回的 _value 字符串转数字，非数字返回 null（而不是 0，避免污染） */
-function num(v: string | undefined): number | null {
-  if (v === undefined || v === '') return null;
+/** 把查询结果的值转数字，非数字返回 null（而不是 0，避免污染） */
+function num(v: string | number | boolean | null | undefined): number | null {
+  if (v === undefined || v === null || v === '') return null;
   const n = Number(v);
   return Number.isFinite(n) ? n : null;
 }
@@ -114,17 +108,19 @@ export async function registerStatsRoutes(app: FastifyInstance): Promise<void> {
         .safeParse(req.query);
       if (!q.success) return reply.code(400).send({ error: 'BAD_RANGE', message: 'hours 需为 1~720' });
 
-      const flux = `from(bucket:"${bucket()}")
-  |> range(start: -${q.data.hours}h)
-  |> filter(fn: (r) => r._measurement == "cluster")
-  |> pivot(rowKey:["_time"], columnKey:["_field"], valueColumn:"_value")
-  |> sort(columns:["_time"])`;
-      const { rows, error } = await queryFlux(flux);
+      // InfluxDB 3 用 SQL（Flux 在 3.x 已移除）。tag/field 天然是列，
+      // 不需要 2.x 那种 pivot 才能把 field 摊平成列。
+      const sql = `SELECT time, nodes_total, nodes_online, nodes_offline, online_ratio,
+       routes_available, routes_approved
+FROM cluster
+WHERE time >= now() - INTERVAL '${q.data.hours} hours'
+ORDER BY time`;
+      const { rows, error } = await querySql(sql);
       if (error) {
         return reply.send({ degraded: true, error, hours: q.data.hours, points: [] });
       }
       const points = rows.map((r) => ({
-        t: r._time,
+        t: r.time,
         nodesTotal: num(r.nodes_total),
         nodesOnline: num(r.nodes_online),
         nodesOffline: num(r.nodes_offline),
@@ -151,18 +147,19 @@ export async function registerStatsRoutes(app: FastifyInstance): Promise<void> {
       if (!q.success) return reply.code(400).send({ error: 'BAD_RANGE', message: 'hours 需为 1~720' });
 
       const id = String(p.data.id);
-      const flux = `from(bucket:"${bucket()}")
-  |> range(start: -${q.data.hours}h)
-  |> filter(fn: (r) => r._measurement == "node_status" and r.node_id == "${id}")
-  |> pivot(rowKey:["_time"], columnKey:["_field"], valueColumn:"_value")
-  |> sort(columns:["_time"])`;
-      const { rows, error } = await queryFlux(flux);
+      // node_id 由路由层强制为 int，不可能带引号，拼进 SQL 安全
+      const sql = `SELECT time, name, online, online_streak_sec, last_seen_age_sec,
+       routes_available, routes_approved
+FROM node_status
+WHERE node_id = '${id}' AND time >= now() - INTERVAL '${q.data.hours} hours'
+ORDER BY time`;
+      const { rows, error } = await querySql(sql);
       if (error) {
         return reply.send({ degraded: true, error, nodeId: p.data.id, hours: q.data.hours, points: [] });
       }
 
       const points = rows.map((r) => ({
-        t: r._time,
+        t: r.time,
         online: num(r.online) === 1,
         onlineStreakSec: num(r.online_streak_sec),
         lastSeenAgeSec: num(r.last_seen_age_sec),
@@ -173,7 +170,7 @@ export async function registerStatsRoutes(app: FastifyInstance): Promise<void> {
       // 在线时长按采样点积分（见 integrateOnline 注释）
       const samples: Sample[] = rows
         .map((r) => {
-          const t = r._time ? Math.floor(new Date(r._time).getTime() / 1000) : NaN;
+          const t = r.time ? Math.floor(new Date(String(r.time)).getTime() / 1000) : NaN;
           return { t, v: num(r.online) ?? 0 };
         })
         .filter((s) => Number.isFinite(s.t));
@@ -200,22 +197,22 @@ export async function registerStatsRoutes(app: FastifyInstance): Promise<void> {
 
   // ---------------------------------------------------------------- 全节点概览
   app.get('/api/stats/overview', { preHandler: requirePermission('node:read') }, async (_req, reply) => {
-    const flux = `from(bucket:"${bucket()}")
-  |> range(start: -24h)
-  |> filter(fn: (r) => r._measurement == "node_status" and r._field == "online")
-  |> keep(columns:["_time","node_id","name","_value"])`;
-    const { rows, error } = await queryFlux(flux);
+    const sql = `SELECT time, node_id, name, online
+FROM node_status
+WHERE time >= now() - INTERVAL '24 hours'
+ORDER BY time`;
+    const { rows, error } = await querySql(sql);
     if (error) return reply.send({ degraded: true, error, nodes: [] });
 
     // 按 node_id 聚合：取最后一次状态 + 在线点占比
     const byNode = new Map<string, { name: string; last: number; onlineSamples: number; totalSamples: number; firstT: number; lastT: number }>();
     for (const r of rows) {
-      const id = r.node_id;
-      if (!id || !r._time) continue;
-      const t = new Date(r._time).getTime();
+      const id = r.node_id === null || r.node_id === undefined ? '' : String(r.node_id);
+      if (!id || !r.time) continue;
+      const t = new Date(String(r.time)).getTime();
       if (!Number.isFinite(t)) continue;
-      const v = num(r._value) ?? 0;
-      const name = r.name || id;
+      const v = num(r.online) ?? 0;
+      const name = r.name === null || r.name === undefined || r.name === '' ? id : String(r.name);
       const cur = byNode.get(id);
       if (!cur) {
         byNode.set(id, { name, last: v, onlineSamples: v >= 1 ? 1 : 0, totalSamples: 1, firstT: t, lastT: t });

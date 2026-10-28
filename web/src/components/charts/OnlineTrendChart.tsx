@@ -96,8 +96,9 @@ export function OnlineTrendChart({
             <div className="mb-1">InfluxDB 查询失败，当前只能看到实时状态，历史数据暂不可读。</div>
             <div className="font-mono text-[11.5px] text-ink-500">{data.error}</div>
             <div className="mt-1.5 text-ink-500">
-              排查：`container list --all` 看 hs-influx 是否 running；
-              `/api/stats/health` 看 influx.detail。
+              排查：<code>docker compose ps</code> 看 influxdb 是否 running；
+              <code>/api/stats/health</code> 看 influx.detail；
+              首次启用 InfluxDB 3.x 需先创建 admin token（见部署文档）。
             </div>
           </div>
         }

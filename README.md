@@ -37,7 +37,7 @@ headscale 本身做不到的事，本面板不会假装能做：
 └────┬──────────────┬──────────────┬────────┘
      │ REST         │ 写文件        │ line protocol
      ▼              ▼              ▼
- Headscale      extra-records   InfluxDB 2.x
+ Headscale      extra-records   InfluxDB 3.x
  v0.29.6       (fsnotify 热加载)  (未配置则降级 SQLite)
 ```
 
@@ -47,7 +47,7 @@ headscale 本身做不到的事，本面板不会假装能做：
 |----|------|------------|
 | 后端 | Node 22 + TypeScript + Fastify | 全栈同语言；管理面低 QPS，Node 够用。放弃 Go：功能广度上开发效率差距太大 |
 | 面板库 | Node 内置 `node:sqlite` | **零原生编译依赖**（国内网络下 better-sqlite3 的 prebuild 常下载失败）。代价：Node 22 中标记 experimental，故用仓储层封装，将来可无痛换 Postgres |
-| 时序库 | InfluxDB 2.7（line protocol） | 写入量大、读模式是聚合查询。未配置时自动降级 SQLite，功能不中断 |
+| 时序库 | InfluxDB **3.12.1 Core**（line protocol 写入 + SQL 查询） | 写入量大、读模式是聚合查询。3.x 已移除 Flux，官方明确新负载走 SQL。未配置时自动降级，功能不中断 |
 | 前端 | React 18 + Vite + Tailwind + Recharts + React Flow | 对应拓扑可视化与图表诉求 |
 | 认证 | 服务端 Session + bcrypt + TOTP + jose | 选 Session 而非纯 JWT：换取「可撤销」（禁用账户/改密立即踢下线） |
 | 传输 | REST（`/api/v1/*`） | 实测确认不需要 gRPC；gRPC 作为备选保留 |
@@ -165,6 +165,36 @@ required variable INFLUX_TOKEN is missing a value → 退出码 1
 所以拆成 `docker-compose.metrics.yml`：主文件只校验真正的必需项，
 可选组件的校验推迟到你真要启用它的时候。
 
+### InfluxDB 3.x 与 2.x 不兼容
+
+| | 2.x | **3.x（当前）** |
+|---|---|---|
+| 端口 | 8086 | **8181**（compose 宿主侧仍映射 8086） |
+| 查询 | Flux | **SQL**（Flux 已移除） |
+| 身份 | org + bucket | **database**（无 org） |
+| 建库 | 需预建 bucket | **首次写入自动创建** |
+| 初始化 | `DOCKER_INFLUXDB_INIT_*` 自动 setup | **需手工建一次 admin token** |
+
+首次启用时序库需要三步（一次性）：
+
+```bash
+# 1. 起时序库
+docker compose -f docker-compose.yml -f docker-compose.metrics.yml \
+               --profile metrics up -d influxdb
+
+# 2. 建 admin token（取返回 JSON 的 token 字段，形如 apiv3_...）
+curl -X POST http://127.0.0.1:8086/api/v3/configure/token/admin
+
+# 3. 填进 .env 后重启面板
+#    INFLUX_URL=http://influxdb:8181
+#    INFLUX_TOKEN=apiv3_xxxxx
+#    INFLUX_BUCKET=headscale_admin
+docker compose up -d panel
+```
+
+不内置自动初始化容器：token 是生产密钥，让它静默生成并落在共享卷里，
+比「人看着填一次」更容易出事。
+
 ### 必须配 TLS
 
 面板走 `http` 时口令是**明文传输**。生产部署请在前面加 nginx/Caddy 终止 TLS，
@@ -271,7 +301,7 @@ npm run dev
 | `lab/e2e_acl.py` | 93 | 策略读写与漂移检测、本地校验拦住 10 类非法策略、**高危护栏**（全通↔全禁必须显式确认，并用 `/debug/filter` 验证上游编译结果真的变了）、**标签不可逆语义**、访问检查 9 类边界、版本历史/差异/回滚、权限拦截。测试**自建自清**一次性设备（因打标签不可逆） |
 | `lab/verify_acl_ui.mjs` | 33 | ACL 页真实 DOM 断言：五个标签页、可视化编辑器四个区块、**非法策略触发错误且两处「应用策略」按钮同步禁用**、访问矩阵格子渲染、访问检查交互求值、版本表格、无运行时错误 |
 | `lab/verify_acl_semantics.py` | 6 | 面板求值结论与上游 `/debug/filter` 编译结果**交叉验证**（含 `{}` vs `{"acls":[]}` 的危险区分）。容器模式下整体 SKIP（该端点仅限本机回环） |
-| `server/src/timeseries/influx.test.ts` | 24 | line protocol 转义/类型/空 field 丢弃、**annotated CSV 解析**（含 `pivot()` 后无 `_value` 列的回归用例） |
+| `server/src/timeseries/influx.test.ts` | 30 | line protocol 转义/类型/空 field 丢弃、**3.x SQL JSON 解析**、**time 缺时区补 Z**（含幂等与毫秒用例）、查询失败返回纯文本时的降级 |
 | `lab/verify_stats_ui.mjs` | 28 | 趋势图真实 svg/图例/坐标轴/面积层/**折线层**、时序库自检显示真实写入计数、时长表列头与实际观测区间、窗口切换、**「流量不可得」是否如实告知**、无运行时异常 |
 | `server/src/services/metrics.test.ts` | 38 | 路径归一化（`/api/nodes/123` → `/:id`，令牌段 → `/:key`）、状态分类、**无请求时 errorRate 为 null 而非 0**、分位边界（单样本/零样本）、指标接口自身不计入（防自我放大）、NaN 耗时安全处理 |
 | `server/src/oidc/keys.test.ts` | 51 | 私钥 AES-GCM 加密落库、**JWKS 不含 d/p/q/dp/dq/qi**、签发即自验、aud/iss 交叉校验、claims 齐全、**轮换后旧 token 仍可验签**（按 kid 选公钥）、强制退役的预期代价 |
