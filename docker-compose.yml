@@ -49,7 +49,9 @@ services:
         # 国内网络可覆盖：NODE_IMAGE=docker.m.daocloud.io/library/node
         NODE_IMAGE: ${NODE_IMAGE:-node:22-alpine}
         NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmjs.org}
-        PANEL_VERSION: ${PANEL_VERSION:-0.0.0-dev}
+        # 留空 = 沿用 package.json 里的版本（发版后即真版本）。
+        # 若在这里写死默认值，会把真实版本覆盖掉。
+        PANEL_VERSION: ${PANEL_VERSION:-}
         VCS_REF: ${VCS_REF:-unknown}
         BUILD_DATE: ${BUILD_DATE:-unknown}
     container_name: headscale-admin

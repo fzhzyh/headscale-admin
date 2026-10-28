@@ -61,10 +61,29 @@ COPY server/ server/
 COPY web/ web/
 COPY scripts/ scripts/
 
-# 版本一致性校验：package.json 的版本必须与构建参数一致（由 CI 传入 tag 版本）
-ARG PANEL_VERSION=0.0.0-dev
-RUN node scripts/set-version.mjs "${PANEL_VERSION}" \
- && node scripts/set-version.mjs --check "${PANEL_VERSION}"
+# ---- 版本号 ----
+#
+# PANEL_VERSION **默认为空**，表示「沿用 package.json 里的版本」。
+#
+# ⚠️ 之前默认值是 `0.0.0-dev`，导致一个隐蔽缺陷：不传 --build-arg 时
+#    （README 里推荐的 `docker build -t headscale-admin:latest .` 就是这种）
+#    set-version.mjs 会把 package.json 从真实版本**改写成 0.0.0-dev**，
+#    于是镜像里显示 0.0.0-dev —— 与「版本号单一真源（git tag → package.json）」
+#    的设计直接冲突：真源本来是 package.json，默认构建反而把它冲掉。
+#
+# 现在的语义：
+#   · 不传           → 用 package.json 里的版本（发版后构建到的就是真版本）
+#   · 传了           → 覆盖并校验三个 package.json 一致（CI 用它对齐 tag）
+ARG PANEL_VERSION=
+RUN if [ -n "${PANEL_VERSION}" ]; then \
+      echo "使用构建参数指定的版本：${PANEL_VERSION}" && \
+      node scripts/set-version.mjs "${PANEL_VERSION}" && \
+      node scripts/set-version.mjs --check "${PANEL_VERSION}"; \
+    else \
+      V="$(node -p "require('./package.json').version")" && \
+      echo "未指定 PANEL_VERSION，沿用 package.json 版本：${V}" && \
+      node scripts/set-version.mjs --check "${V}"; \
+    fi
 
 # 类型检查 + 构建（web 先，server 的静态资源托管依赖 web/dist）
 RUN npm run typecheck && npm run build
@@ -96,14 +115,14 @@ RUN npm ci --omit=dev --no-audit --no-fund && npm cache clean --force
 # ============================================================
 FROM ${NODE_IMAGE} AS runtime
 
-ARG PANEL_VERSION=0.0.0-dev
+ARG PANEL_VERSION=
 ARG VCS_REF=unknown
 ARG BUILD_DATE=unknown
 
 # OCI 标准标签：便于镜像仓库/编排系统识别来源与版本
 LABEL org.opencontainers.image.title="headscale-admin" \
       org.opencontainers.image.description="Headscale v0.29.x Web 管理面板（设备/用户/ACL/路由/DNS/资源/监控/内置 OIDC Provider）" \
-      org.opencontainers.image.version="${PANEL_VERSION}" \
+      org.opencontainers.image.version="${PANEL_VERSION:-see-package-json}" \
       org.opencontainers.image.revision="${VCS_REF}" \
       org.opencontainers.image.created="${BUILD_DATE}" \
       org.opencontainers.image.licenses="MIT"
