@@ -23,6 +23,16 @@
 # ## 关于 headscale 容器
 # 这里给的是**完整可跑**的编排（含 headscale）。若你已有 headscale，
 # 删掉 `headscale:` 服务，把 .env 里 HS_URL 指向现有实例即可。
+#
+# ## 可选的 InfluxDB 不在这里
+# 它拆到了 docker-compose.metrics.yml。原因：Compose 在**解析整个文件**时
+# 就做变量插值，profile 是否启用并不影响 `${INFLUX_TOKEN:?}` 的求值 ——
+# 实测表现为「只想跑 panel+headscale，却因为 influx 的必填变量缺失，
+# 整个 compose 报 required variable ... is missing」直接退出。
+# 可选组件的必填校验不该阻塞核心服务启动，故拆成 overlay：
+#
+#   docker compose -f docker-compose.yml -f docker-compose.metrics.yml \
+#                  --profile metrics up -d
 
 name: headscale-admin
 
@@ -146,8 +156,11 @@ services:
       - ${DNS_RECORDS_DIR:-./data/dns}:/dns
 
     ports:
-      # 只绑回环：面板经内部网络访问它，不需要对外暴露控制面
-      - "${HS_BIND:-127.0.0.1}:8080:8080"
+      # 只绑回环：面板经内部网络访问它，不需要对外暴露控制面。
+      # 宿主端口可配（HS_PORT）：宿主上 8080 常被别的服务占着，
+      # 实测就踩过 `Bind for 0.0.0.0:8080 failed: port is already allocated`
+      # 导致 headscale 起不来。容器内端口固定 8080 不动。
+      - "${HS_BIND:-127.0.0.1}:${HS_PORT:-8080}:8080"
 
     networks:
       - hs-net
@@ -155,53 +168,6 @@ services:
     healthcheck:
       # 官方镜像是 distroless（无 wget/curl/sh），所以用二进制自己的 health 子命令
       test: ["CMD", "headscale", "health"]
-      interval: 15s
-      timeout: 5s
-      start_period: 20s
-      retries: 5
-
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
-
-  # ============================================================
-  # InfluxDB（可选，用于在线时长/趋势曲线）
-  # 不需要就 `docker compose --profile metrics up -d` 时不带该 profile
-  # ============================================================
-  influxdb:
-    image: ${INFLUX_IMAGE:-influxdb:2.7-alpine}
-    container_name: headscale-influx
-    restart: unless-stopped
-    profiles: ["metrics"]
-
-    # ⚠️ 必须用非 root：官方 entrypoint 在 root 下会 chown 数据目录，
-    # 某些挂载类型（virtiofs 等）不允许 chown → 容器直接退出，
-    # 日志只有两行 chmod/chown 报错。非 root 会跳过该分支。
-    user: influxdb
-
-    environment:
-      DOCKER_INFLUXDB_INIT_MODE: setup
-      DOCKER_INFLUXDB_INIT_USERNAME: ${INFLUX_ADMIN_USER:-admin}
-      DOCKER_INFLUXDB_INIT_PASSWORD: ${INFLUX_ADMIN_PASSWORD:?启用 metrics profile 时必须设置 INFLUX_ADMIN_PASSWORD}
-      DOCKER_INFLUXDB_INIT_ORG: ${INFLUX_ORG:-headscale}
-      DOCKER_INFLUXDB_INIT_BUCKET: ${INFLUX_BUCKET:-headscale_admin}
-      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: ${INFLUX_TOKEN:?启用 metrics profile 时必须设置 INFLUX_TOKEN}
-      DOCKER_INFLUXDB_INIT_RETENTION: 90d
-
-    volumes:
-      - influx-data:/var/lib/influxdb2
-      - influx-etc:/etc/influxdb2
-
-    ports:
-      - "${INFLUX_BIND:-127.0.0.1}:8086:8086"
-
-    networks:
-      - hs-net
-
-    healthcheck:
-      test: ["CMD", "influxdb", "health"]
       interval: 15s
       timeout: 5s
       start_period: 20s
@@ -221,5 +187,3 @@ volumes:
   # 面板数据：SQLite + 加密主密钥。**必须备份**，丢了等于丢所有账号
   panel-data:
   headscale-data:
-  influx-data:
-  influx-etc:

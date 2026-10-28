@@ -68,12 +68,27 @@ dns:
       - 223.5.5.5
       - 119.29.29.29
     split: {}
-  # extra_records 热加载：写文件即生效（fsnotify 监听），无需重启
-  # ⚠️ 与 inline 的 extra_records 互斥，同时配置会 fatal 退出
-  # ⚠️ 路径不能放在 /var/lib/headscale 下面——该目录本身是挂载点，
-  #    其下再挂子目录会被父挂载遮蔽，fsnotify 监听一个不存在的路径
-  #    （写文件毫无反应且无任何日志，最难排查的一类）
-  extra_records_path: /dns/extra-records.json
+  # extra_records 热加载：写文件即生效（fsnotify 监听），无需重启。
+  #
+  # ⚠️ **默认注释掉**，因为实测踩到：headscale 启动时会 stat 这个路径，
+  #    文件不存在就直接 fatal 退出 ——
+  #
+  #      Error: headscale ran into an error and had to shut down:
+  #      setting up extrarecord manager: getting file info:
+  #      stat /dns/extra-records.json: no such file or directory
+  #
+  #    首次部署时文件当然不存在，于是「照文档部署却起不来」。
+  #
+  # 启用步骤：
+  #   echo '[]' > data/dns/extra-records.json     # 必须先建空数组
+  #   去掉下面这行的注释，docker compose restart headscale
+  #
+  # 另两个坑：
+  #   · 与 inline 的 extra_records 互斥，同时配置会 fatal 退出
+  #   · 路径不能放在 /var/lib/headscale 下面 —— 该目录本身是挂载点，
+  #     其下再挂子目录会被父挂载遮蔽，fsnotify 监听一个不存在的路径
+  #     （写文件毫无反应且无任何日志，最难排查的一类）
+  # extra_records_path: /dns/extra-records.json
 
 # ============================================================
 # 日志
@@ -83,30 +98,51 @@ log:
   format: text
 
 # ============================================================
-# OIDC —— 指向本面板的内置 Provider
+# OIDC —— 默认关闭
 # ============================================================
-# 面板「OIDC Provider」页会直接给出这三项的值，复制过来即可。
-# ⚠️ issuer 必须与客户端实际访问的地址**完全一致**，否则 iss 校验失败。
-oidc:
-  only_start_if_oidc_is_available: true
-  issuer: "https://hs-admin.example.com"   # TODO: 填面板对外地址
-  client_id: "oidc_xxxxxxxxxxxxxxxx"       # TODO: 面板 OIDC 页创建客户端后填入
-  client_secret: "oidcs_xxxxxxxxxxxxxxxx"  # TODO: 创建时只显示一次
-  scope: ["openid", "profile", "email", "groups"]
-  # 若希望只有特定域名的用户能登录，用 allowed_domains 收紧
-  # allowed_domains:
-  #   - example.com
-  pkce:
-    enabled: true
-    method: "S256"
-  # 从 ID Token 的哪个 claim 取用户名（面板透传 preferred_username）
-  # headscale v0.29 已移除 strip_email_domain / map_legacy_users，配置会 fatal
+# ⚠️ **整段默认注释掉**，原因是实测踩到的坑：
+#
+# 只要 `oidc` 段存在且 `only_start_if_oidc_is_available: true`，
+# headscale 启动时就会去拉 issuer 的 well-known 配置。填占位符域名时：
+#
+#   Error: initializing: creating new headscale: creating OIDC provider
+#   from issuer config: Get "https://hs-admin.example.com/.well-known/
+#   openid-configuration": dial tcp: lookup hs-admin.example.com: no such host
+#
+# → 容器起来就退出，连 headscale 本体都用不了。
+#
+# 正确顺序是「先让 headscale 跑起来，再配 OIDC」：
+#   1. 面板启动并在「OIDC Provider」页创建客户端
+#   2. 把 issuer / client_id / client_secret 填到下面，去掉注释
+#   3. docker compose restart headscale
+#
+# issuer 必须与面板对外地址**完全一致**（它是 OIDC 的 iss，不一致会校验失败）。
+#
+# oidc:
+#   only_start_if_oidc_is_available: true
+#   issuer: "https://hs-admin.example.com"
+#   client_id: "oidc_xxxxxxxxxxxxxxxx"
+#   client_secret: "oidcs_xxxxxxxxxxxxxxxx"
+#   scope: ["openid", "profile", "email", "groups"]
+#   # 只允许特定域名邮箱登录时收紧
+#   # allowed_domains:
+#   #   - example.com
+#   pkce:
+#     enabled: true
+#     method: "S256"
+#   # 注意：headscale v0.29 已移除 strip_email_domain / map_legacy_users，
+#   # 残留这些键会直接 fatal 退出。
 
 # ============================================================
 # 其他
 # ============================================================
 disable_check_updates: true
-ephemeral_node_inactivity_timeout: 30m
+
+# ⚠️ `ephemeral_node_inactivity_timeout` 在 v0.29 已移除（启动会告警），
+# 改到 node.ephemeral 下面：
+node:
+  ephemeral:
+    inactivity_timeout: 30m
 
 policy:
   mode: database

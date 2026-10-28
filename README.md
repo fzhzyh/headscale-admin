@@ -118,7 +118,9 @@ docker compose up -d panel
 docker compose logs -f panel      # 首次会打印管理员账号与口令
 
 # 6.（可选）启用时序库，用于在线时长与趋势曲线
-docker compose --profile metrics up -d
+#     注意：要用 -f 叠加 overlay 文件，不能只靠 --profile
+docker compose -f docker-compose.yml -f docker-compose.metrics.yml \
+               --profile metrics up -d
 ```
 
 ### 镜像构建
@@ -146,6 +148,22 @@ docker build -t headscale-admin:latest .
 | 能力 | `cap_drop: ALL` | 面板不需要任何 Linux capability |
 | 健康检查 | 面板自己的 `/api/system/health` | 它同时校验 DB 可达，不只是进程活着 |
 | 版本 | `scripts/set-version.mjs` 从 git tag 同步 | 避免「设置页显示 0.1.0，实际发布 v1.0.0」 |
+
+### 为什么 InfluxDB 单独一个 compose 文件
+
+Compose 在**解析整个文件**时就做变量插值，`profiles` 是否启用**不影响**
+`${VAR:?}` 的求值。若把 influxdb 放在主文件里，实测会这样：
+
+```
+$ docker compose up -d headscale
+error while interpolating services.influxdb.environment.DOCKER_INFLUXDB_INIT_ADMIN_TOKEN:
+required variable INFLUX_TOKEN is missing a value → 退出码 1
+```
+
+只想跑核心服务，却被可选组件的必填校验挡住，连 headscale 都没起来。
+
+所以拆成 `docker-compose.metrics.yml`：主文件只校验真正的必需项，
+可选组件的校验推迟到你真要启用它的时候。
 
 ### 必须配 TLS
 

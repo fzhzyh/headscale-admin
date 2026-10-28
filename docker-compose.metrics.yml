@@ -1,0 +1,83 @@
+# 可选组件：InfluxDB 时序库（用于在线时长与趋势曲线）
+#
+# ## 为什么单独一个文件
+#
+# Compose 在**解析整个文件**时就做变量插值，`profiles` 是否启用**不影响**
+# `${VAR:?}` 的求值。把 influxdb 放在主文件里，实测表现为：
+#
+#     $ docker compose up -d headscale
+#     error while interpolating services.influxdb.environment.
+#     DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: required variable INFLUX_TOKEN is missing
+#     → 退出码 1，连 headscale 都没起
+#
+# 也就是说：只想跑核心服务，却被可选组件的必填校验挡住。
+# 拆分 overlay 后，主文件只管真正的必需项，可选组件的校验只在
+# 你真的要用它时才生效。
+#
+# ## 用法
+#
+#   # 启用（三个变量必须先填好，缺了会在此刻报错，符合预期）
+#   docker compose -f docker-compose.yml -f docker-compose.metrics.yml \
+#                  --profile metrics up -d
+#
+#   # 只起时序库
+#   docker compose -f docker-compose.yml -f docker-compose.metrics.yml \
+#                  --profile metrics up -d influxdb
+#
+#   # 停掉并保留数据
+#   docker compose -f docker-compose.yml -f docker-compose.metrics.yml \
+#                  --profile metrics stop influxdb
+#
+# ## 面板侧如何接上
+# 在 .env 里补 `INFLUX_URL=http://influxdb:8086`（面板与 influx 都在
+# hs-net 网络内，用服务名即可）。INFLUX_ORG / INFLUX_BUCKET / INFLUX_TOKEN
+# 要与下面 DOCKER_INFLUXDB_INIT_* 保持一致。
+
+services:
+  influxdb:
+    image: ${INFLUX_IMAGE:-influxdb:2.7-alpine}
+    container_name: headscale-influx
+    restart: unless-stopped
+    profiles: ["metrics"]
+
+    # ⚠️ 必须用非 root：官方 entrypoint 在 root 下会 chown 数据目录，
+    # 某些挂载类型（virtiofs 等）不允许 chown → 容器直接退出，
+    # 日志只有两行 chmod/chown 报错。非 root 会跳过该分支。
+    user: influxdb
+
+    environment:
+      DOCKER_INFLUXDB_INIT_MODE: setup
+      DOCKER_INFLUXDB_INIT_USERNAME: ${INFLUX_ADMIN_USER:-admin}
+      DOCKER_INFLUXDB_INIT_PASSWORD: ${INFLUX_ADMIN_PASSWORD:?启用 metrics 时必须设置 INFLUX_ADMIN_PASSWORD（openssl rand -base64 24）}
+      DOCKER_INFLUXDB_INIT_ORG: ${INFLUX_ORG:-headscale}
+      DOCKER_INFLUXDB_INIT_BUCKET: ${INFLUX_BUCKET:-headscale_admin}
+      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: ${INFLUX_TOKEN:?启用 metrics 时必须设置 INFLUX_TOKEN（openssl rand -hex 32）}
+      DOCKER_INFLUXDB_INIT_RETENTION: 90d
+      TZ: ${TZ:-Asia/Shanghai}
+
+    volumes:
+      - influx-data:/var/lib/influxdb2
+      - influx-etc:/etc/influxdb2
+
+    ports:
+      - "${INFLUX_BIND:-127.0.0.1}:${INFLUX_PORT:-8086}:8086"
+
+    networks:
+      - hs-net
+
+    healthcheck:
+      test: ["CMD", "influxdb", "health"]
+      interval: 15s
+      timeout: 5s
+      start_period: 20s
+      retries: 5
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  influx-data:
+  influx-etc:
