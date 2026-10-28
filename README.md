@@ -89,6 +89,87 @@ TCP 也能建连，但请求一律 `Connection reset by peer`；
 因此用 `lab/hostport.py` 做一层透明 TCP 转发，对外地址仍是约定的 `100.64.0.3`。
 若上游修好了，删掉转发层即可，**测试侧地址不变**。
 
+## 生产部署（Docker Compose，推荐用于正式环境）
+
+面向**长期运行**的生产环境。与上面的 Apple container 联调环境是两套东西：
+联调环境用 `container/up.sh`，生产用 `docker compose`。
+
+```bash
+# 1. 准备配置（密钥绝不入库）
+cp .env.example .env
+chmod 600 .env
+
+# 2. 生成强密钥并填入 .env
+openssl rand -hex 32      # → PANEL_MASTER_KEY
+openssl rand -hex 32      # → PANEL_SESSION_SECRET
+openssl rand -base64 24   # → PANEL_ADMIN_SECRET
+
+# 3. 必填三项（缺失会直接报错退出，不会用默认值静默启动）
+#    PANEL_PUBLIC_URL   浏览器实际访问地址，如 https://hs-admin.example.com
+#    HS_API_KEY         先在 headscale 侧生成（见下）
+#    PANEL_MASTER_KEY / PANEL_SESSION_SECRET
+
+# 4. 起 headscale，生成 API Key，填回 .env
+docker compose up -d headscale
+docker compose exec headscale headscale apikeys create --expiration 999d
+
+# 5. 起面板
+docker compose up -d panel
+docker compose logs -f panel      # 首次会打印管理员账号与口令
+
+# 6.（可选）启用时序库，用于在线时长与趋势曲线
+docker compose --profile metrics up -d
+```
+
+### 镜像构建
+
+```bash
+# 国内网络（基础镜像与 npm 源都走镜像站）
+docker build \
+  --build-arg NODE_IMAGE=docker.m.daocloud.io/library/node \
+  --build-arg NPM_REGISTRY=https://registry.npmmirror.com \
+  --build-arg PANEL_VERSION=$(git describe --tags --always | sed 's/^v//') \
+  -t headscale-admin:1.0.0 .
+
+# 默认（官方源）
+docker build -t headscale-admin:latest .
+```
+
+镜像特性：
+
+| 项 | 做法 | 原因 |
+|---|---|---|
+| 用户 | **非 root**（node uid 1000） | 容器逃逸时 root 是最大放大器；面板只需写 `/data` |
+| 依赖 | `npm ci --omit=dev` 独立阶段 | tsc / vite / playwright 不进运行镜像 |
+| 信号 | `tini` 作为 PID 1 | Node 作 PID 1 不转发 SIGTERM，硬杀会让 SQLite 留下未 checkpoint 的 WAL |
+| 根文件系统 | compose 里 `read_only: true` | 缩小攻击面；只留 `/tmp`、`/run`、`/data` 可写 |
+| 能力 | `cap_drop: ALL` | 面板不需要任何 Linux capability |
+| 健康检查 | 面板自己的 `/api/system/health` | 它同时校验 DB 可达，不只是进程活着 |
+| 版本 | `scripts/set-version.mjs` 从 git tag 同步 | 避免「设置页显示 0.1.0，实际发布 v1.0.0」 |
+
+### 必须配 TLS
+
+面板走 `http` 时口令是**明文传输**。生产部署请在前面加 nginx/Caddy 终止 TLS，
+并让 `PANEL_PUBLIC_URL` 与实际访问地址**完全一致**（它是 OIDC 的 issuer，
+不一致会导致 headscale 侧 `iss` 校验失败）。
+
+compose 默认只把端口绑在 `127.0.0.1`，就是强制你走反代。
+
+### 数据备份
+
+`panel-data` 卷里有两个必须备份的文件：
+
+| 文件 | 丢失后果 |
+|---|---|
+| `panel.sqlite` | 所有账号、会话、ACL 版本、审计日志 |
+| `master.key` | **库内所有加密字段解不开**（Headscale API Key、TOTP 密钥、OIDC 私钥） |
+
+```bash
+docker compose exec panel sh -c 'tar czf - /data' > panel-backup-$(date +%F).tar.gz
+```
+
+> 只备份 `panel.sqlite` 而不备份 `master.key` 等于没备份——恢复后加密字段全是废数据。
+
 ## 本地裸进程方式（备选，无容器时）
 
 ```bash

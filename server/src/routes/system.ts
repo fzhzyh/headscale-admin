@@ -11,10 +11,12 @@ import { getSetting } from '../services/settings.ts';
 import { PERMISSIONS, ALL_PERMISSIONS } from '../auth/rbac.ts';
 import { isNeverExpiring } from './nodes.ts';
 
-/** 面板版本，与 HEADSCALE 版本解耦 */
-export const PANEL_VERSION = '0.1.0';
-/** 面板面向的 Headscale 版本 */
-export const TARGET_HEADSCALE = 'v0.29.x';
+/**
+ * 版本号来自 version.ts（单一真源：git tag → package.json → 运行期读取）。
+ * 这里再导出一次，保持既有 `import { PANEL_VERSION } from './routes/system.ts'` 可用。
+ */
+export { PANEL_VERSION, TARGET_HEADSCALE } from '../version.ts';
+import { PANEL_VERSION, TARGET_HEADSCALE } from '../version.ts';
 
 export async function registerSystemRoutes(app: FastifyInstance): Promise<void> {
   // 存活探针：不查上游，供容器编排使用

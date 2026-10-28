@@ -1,6 +1,6 @@
 {
   "name": "headscale-admin",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "private": true,
   "description": "Headscale v0.29.x Web 管理面板 —— 设备/用户/ACL/路由/DNS/资源/监控/内置 OIDC Provider",
   "workspaces": [

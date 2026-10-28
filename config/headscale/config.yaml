@@ -1,0 +1,112 @@
+# headscale 生产配置（配合 docker-compose.yml）
+#
+# 与 container/hs-config.yaml（联调版）的区别：
+#   · 域名/地址用占位符，部署时按实际改
+#   · 日志级别 info（联调版是 debug，生产会刷爆磁盘）
+#   · 保留内置 DERP 服务器，避免启动依赖外网
+#
+# 部署前必须改的 3 处，已用 TODO 标出。
+
+server_url: https://hs.example.com        # TODO: 改成 Tailscale 客户端能访问的地址
+listen_addr: 0.0.0.0:8080
+metrics_listen_addr: 0.0.0.0:9090
+grpc_listen_addr: 0.0.0.0:50443
+grpc_allow_insecure: false
+
+noise:
+  private_key_path: /var/lib/headscale/noise_private.key
+
+prefixes:
+  v4: 100.64.0.0/10
+  v6: fd7a:115c:a1e0::/48
+  allocation: sequential
+
+# ============================================================
+# DERP
+# ============================================================
+# ⚠️ 两个实测坑，决定了这里的写法：
+#
+# 1. 拉远程地图会让**启动依赖外网**。外网一抖就是
+#    `getting DERPMap: Get "https://controlplane.tailscale.com/derpmap/default":
+#     net/http: TLS handshake timeout` → 容器起来又立刻退出。
+# 2. 本地静态地图写 `regions: {}` 会被拒：
+#    `initial DERPMap is empty, Headscale requires at least one entry`。
+#
+# ⇒ 启用内置 DERP 服务器：自带一个 region，地图非空、零外网依赖。
+#   如果节点都在同一内网、不需要中继，也可保留它（不占用时就只是多一个 region）。
+derp:
+  server:
+    enabled: true
+    region_id: 999
+    region_code: local
+    region_name: Local Embedded DERP
+    stun_listen_addr: 0.0.0.0:3478
+    private_key_path: /var/lib/headscale/derp_server_private.key
+  urls: []
+  paths: []
+  auto_update_enabled: false
+
+# ============================================================
+# 数据库
+# ============================================================
+database:
+  type: sqlite
+  sqlite:
+    path: /var/lib/headscale/db.sqlite
+    write_ahead_log: true
+
+# ============================================================
+# DNS
+# ============================================================
+dns:
+  magic_dns: true
+  base_domain: hs.internal             # TODO: 改成你的内部域名
+  # ⚠️ override_local_dns: true 时 nameservers.global 为空是 **fatal**（不是警告）
+  override_local_dns: true
+  nameservers:
+    global:
+      - 223.5.5.5
+      - 119.29.29.29
+    split: {}
+  # extra_records 热加载：写文件即生效（fsnotify 监听），无需重启
+  # ⚠️ 与 inline 的 extra_records 互斥，同时配置会 fatal 退出
+  # ⚠️ 路径不能放在 /var/lib/headscale 下面——该目录本身是挂载点，
+  #    其下再挂子目录会被父挂载遮蔽，fsnotify 监听一个不存在的路径
+  #    （写文件毫无反应且无任何日志，最难排查的一类）
+  extra_records_path: /dns/extra-records.json
+
+# ============================================================
+# 日志
+# ============================================================
+log:
+  level: info                          # 生产用 info；排查问题时临时改 debug
+  format: text
+
+# ============================================================
+# OIDC —— 指向本面板的内置 Provider
+# ============================================================
+# 面板「OIDC Provider」页会直接给出这三项的值，复制过来即可。
+# ⚠️ issuer 必须与客户端实际访问的地址**完全一致**，否则 iss 校验失败。
+oidc:
+  only_start_if_oidc_is_available: true
+  issuer: "https://hs-admin.example.com"   # TODO: 填面板对外地址
+  client_id: "oidc_xxxxxxxxxxxxxxxx"       # TODO: 面板 OIDC 页创建客户端后填入
+  client_secret: "oidcs_xxxxxxxxxxxxxxxx"  # TODO: 创建时只显示一次
+  scope: ["openid", "profile", "email", "groups"]
+  # 若希望只有特定域名的用户能登录，用 allowed_domains 收紧
+  # allowed_domains:
+  #   - example.com
+  pkce:
+    enabled: true
+    method: "S256"
+  # 从 ID Token 的哪个 claim 取用户名（面板透传 preferred_username）
+  # headscale v0.29 已移除 strip_email_domain / map_legacy_users，配置会 fatal
+
+# ============================================================
+# 其他
+# ============================================================
+disable_check_updates: true
+ephemeral_node_inactivity_timeout: 30m
+
+policy:
+  mode: database
