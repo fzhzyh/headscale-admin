@@ -157,9 +157,9 @@ npm run dev
 | **P3** | ACL 引擎：可视化编辑、原始 HuJSON、版本历史、访问检查求值器、访问矩阵、AI 辅助 | ✅ 已完成 |
 | **P4** | 监控：InfluxDB 时序采样、在线状态/在线时长、趋势图、**网络拓扑（ACL 逐对求值）** | ✅ 已完成 |
 | **P4+** | 面板自身控制面指标（API 吞吐/错误率/延迟分位/WS 推送量） | ✅ 已完成 |
-| **P5** | 资源中心、DNS 热加载、内置 OIDC Provider、外部 OIDC 登录 | 待开发 |
+| **P5** | **资源中心**（IP+端口 → ACL hosts 同步、冲突检测、参考规则）、DNS 热加载、内置 OIDC Provider、外部 OIDC 登录 | 🚧 进行中（资源中心已完成）|
 
-### 已验证（共 479 项用例，全通过）
+### 已验证（共 534 项用例，全通过）
 
 | 脚本 | 项数 | 覆盖 |
 |------|------|------|
@@ -174,6 +174,7 @@ npm run dev
 | `server/src/timeseries/influx.test.ts` | 24 | line protocol 转义/类型/空 field 丢弃、**annotated CSV 解析**（含 `pivot()` 后无 `_value` 列的回归用例） |
 | `lab/verify_stats_ui.mjs` | 28 | 趋势图真实 svg/图例/坐标轴/面积层/**折线层**、时序库自检显示真实写入计数、时长表列头与实际观测区间、窗口切换、**「流量不可得」是否如实告知**、无运行时异常 |
 | `server/src/services/metrics.test.ts` | 38 | 路径归一化（`/api/nodes/123` → `/:id`，令牌段 → `/:key`）、状态分类、**无请求时 errorRate 为 null 而非 0**、分位边界（单样本/零样本）、指标接口自身不计入（防自我放大）、NaN 耗时安全处理 |
+| `lab/verify_resources.py` | 54 | 资源名校验（挡 ACL 身份语法 `tag:`/`user@`）、IP/CIDR 与端口区间校验、**端口不进 hosts 的职责分离**、同步**逐字节断言 acls 未变**、冲突必须 409 而非静默覆盖、`overwrite` 才改写、参考规则按 ownerGroup 推导且不自动应用、删除时可选清理 hosts |
 | `lab/verify_topology_ui.mjs` | 32 | 拓扑画布与节点数、**边数与 ACL 语义一致**（全通 12 条 → 限制性策略精确 4 条且方向无反边）、**高危护栏 409 NEED_ACK**、全通/全禁不画 N² 箭头、只看在线过滤、语义说明诚实性 |
 
 另有 `server/src/acl/evaluator.test.ts` 56 项 ACL 求值单元测试。

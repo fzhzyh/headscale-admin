@@ -462,7 +462,7 @@ export default function DashboardPage(): React.ReactElement {
               ['网络拓扑可视化', true],
               ['面板控制面指标（API 吞吐/延迟/WS）', true],
               ['设备流量统计（headscale 架构下不可得）', false],
-              ['资源中心', false],
+              ['资源中心（IP+端口 → ACL hosts 同步）', true],
               ['DNS 记录管理', false],
               ['内置 OIDC Provider', false],
               ['外部 OIDC 登录', false],

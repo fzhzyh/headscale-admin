@@ -211,6 +211,7 @@ check('监控统计标为已完成', bodyText.includes('监控统计（在线状
 check('流量项明确标注架构限制', bodyText.includes('设备流量统计（headscale 架构下不可得）'));
 check('网络拓扑标为已完成', bodyText.includes('网络拓扑可视化'));
 check('面板控制面指标标为已完成', bodyText.includes('面板控制面指标（API 吞吐/延迟/WS）'));
+check('资源中心标为已完成', bodyText.includes('资源中心（IP+端口 → ACL hosts 同步）'));
 
 // ---------------------------------------------------------------- 控制台
 console.log('\n' + '='.repeat(88));

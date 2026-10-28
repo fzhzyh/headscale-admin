@@ -568,3 +568,67 @@ export interface PanelMetrics {
   scope: 'panel';
   disclaimer: string;
 }
+
+// ============================================================
+// 资源中心（P5）
+//
+// 模型要点：`name` + `ip` → 同步进 ACL 的 hosts；
+// `ports` / `protocol` **不进 hosts**（hosts 只承载 IP/CIDR），
+// 只用于生成参考规则的 dst（`资源名:端口`）。
+// ============================================================
+
+export interface Resource {
+  id: number;
+  name: string;
+  ip: string;
+  ports: string[];
+  protocol: string;
+  description: string;
+  ownerGroup: string | null;
+  enabled: boolean;
+  /** 最后一次写入 ACL hosts 的时间；改名/改 IP 后清空 */
+  syncedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+  /** 生成规则时用的 dst 片段：name:port，或 name:* */
+  dstForms: string[];
+}
+
+export interface ResourceListResponse {
+  resources: Resource[];
+  stats: { total: number; enabled: number; synced: number; unsynced: number };
+}
+
+export interface ResourceSyncPreview {
+  hostDiff: {
+    adds: { name: string; ip: string }[];
+    updates: { name: string; from: string; to: string }[];
+    conflicts: { name: string; existing: string; wanted: string; resourceId: number }[];
+    orphans: string[];
+  };
+  referenceRules: {
+    resource: string;
+    ownerGroup: string;
+    src: string[];
+    dst: string[];
+    protocol: string;
+    /** 组内无成员绑定网络身份时为 false，生成不了 src */
+    executable: boolean;
+    note: string;
+  }[];
+  policy: {
+    mode: 'allow-all' | 'deny-all' | 'rules';
+    explanation: string;
+    /** 非 rules 模式下 hosts 不会被引用，同步无效果 */
+    hostsEffective: boolean;
+    warning: string | null;
+  };
+  stats: {
+    resources: number;
+    enabled: number;
+    toAdd: number;
+    toUpdate: number;
+    conflicts: number;
+    orphans: number;
+  };
+}

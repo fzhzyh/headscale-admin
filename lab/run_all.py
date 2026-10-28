@@ -80,6 +80,7 @@ def suites() -> list[Suite]:
         Suite("P2 前端", "node", "verify_web.mjs"),
         Suite("P4 统计前端", "node", "verify_stats_ui.mjs"),
         Suite("P4 拓扑前端", "node", "verify_topology_ui.mjs"),
+        Suite("P5 资源中心后端", "python", "verify_resources.py"),
         Suite("P3 ACL 前端", "node", "verify_acl_ui.mjs"),
     ]
 

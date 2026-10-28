@@ -9,6 +9,7 @@ import DashboardPage from './pages/DashboardPage';
 import NodesPage from './pages/NodesPage';
 import RoutesPage from './pages/RoutesPage';
 import TopologyPage from './pages/TopologyPage';
+import ResourcesPage from './pages/ResourcesPage';
 import UsersPage from './pages/UsersPage';
 import KeysPage from './pages/KeysPage';
 import PanelUsersPage from './pages/PanelUsersPage';
@@ -57,6 +58,7 @@ export default function App(): React.ReactElement {
         <Route path="dashboard" element={<DashboardPage />} />
         <Route path="nodes" element={<NodesPage />} />
         <Route path="topology" element={<TopologyPage />} />
+        <Route path="resources" element={<ResourcesPage />} />
         <Route path="routes" element={<RoutesPage />} />
         <Route path="users" element={<UsersPage />} />
         <Route path="keys" element={<KeysPage />} />
