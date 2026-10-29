@@ -1,129 +1,151 @@
-# headscale-admin 生产部署编排
+# headscale-admin 生产编排 —— 核心文件（只有面板）
 #
-# ## 用法
+# ============================================================================
+# 这个文件只负责「面板」本身。headscale 与 InfluxDB 都是**可选的 overlay**，
+# 按你的实际拓扑叠加，不要删改本文件。
+# ============================================================================
 #
-#   cp .env.example .env          # 填入密钥（务必 chmod 600）
-#   docker compose up -d
-#   docker compose logs -f panel
+# ## 三种典型拓扑
 #
-# 首次启动会自动建库、建表、播种管理员账户，并把下面 3 个值写进日志：
+#   ① 对接已有生产 headscale（headscale 已跑在别处，最常见）
+#      docker compose up -d
 #
-#   面板管理员账号 / 口令
+#   ② 一体化：面板 + headscale 一起部署（新建环境、测试、边缘小规模）
+#      docker compose -f docker-compose.yml -f docker-compose.headscale.yml up -d
 #
-# ## 为什么密钥全部走 .env 而不是写在这里
-# compose 文件会进版本库。把 PANEL_MASTER_KEY / HS_API_KEY 写进这里等于
-# 把生产密钥提交到 Git —— 一旦仓库泄露或被 fork，所有部署实例都能被攻破。
-# 这里只声明 `env_file` 与必填校验（`${VAR:?}` 缺失即报错退出），
+#   ③ 在上面任一基础上加时序库（历史曲线 / 在线时长）
+#      docker compose -f docker-compose.yml [-f docker-compose.headscale.yml] \
+#                     -f docker-compose.metrics.yml --profile metrics up -d
+#
+# ## 嫌命令长？把组合写进 .env，之后一条命令搞定
+#
+#   Compose 会读取项目目录下 .env 里的 COMPOSE_FILE，自动叠加：
+#
+#     情景①  COMPOSE_FILE=docker-compose.yml
+#     情景②  COMPOSE_FILE=docker-compose.yml:docker-compose.headscale.yml
+#     情景③  COMPOSE_FILE=docker-compose.yml:docker-compose.metrics.yml
+#
+#   Windows 下分隔符是 `;`。设好后 `docker compose up -d` 即可。
+#   ⚠️ 但 COMPOSE_FILE 会影响**所有** compose 命令（含 down/ps/logs），
+#      切换拓扑时记得先 down 再改，否则会操作到不同的一组容器。
+#
+# ## 为什么 HS_URL 是必填而不是给默认值
+#
+# 面板能对接的 headscale 有五种存在形式：同 compose 的容器、另一个 compose
+# 的容器、宿主机二进制、局域网另一台机器、公网域名。任何默认值都只对其中
+# 一种成立，写死默认值会让另外四种「看起来启动成功、实际连不上」。
+# 所以这里用 `${HS_URL:?...}` 强制你明确指定；只有一体化 overlay 才补默认值。
+#
+# ## 为什么密钥全部走 .env
+#
+# 本文件会进版本库。把 PANEL_MASTER_KEY / HS_API_KEY 写在这里等于把生产密钥
+# 提交到 Git —— 仓库一旦泄露或被 fork，所有部署实例都能被攻破。
+# 这里只做「必填校验」（${VAR:?} 缺失即报错退出），
 # 确保不会用默认值静默启动一个不安全的实例。
-#
-# ## 为什么 panel 用 host 网络之外的独立网络
-# headscale 与 panel 需要互通，但不该让它们直接暴露在宿主网络上。
-# 只有 panel 与 headscale 的必要端口做映射，其余容器间走内部 DNS。
-#
-# ## 关于 headscale 容器
-# 这里给的是**完整可跑**的编排（含 headscale）。若你已有 headscale，
-# 删掉 `headscale:` 服务，把 .env 里 HS_URL 指向现有实例即可。
-#
-# ## 可选的 InfluxDB 不在这里
-# 它拆到了 docker-compose.metrics.yml。原因：Compose 在**解析整个文件**时
-# 就做变量插值，profile 是否启用并不影响 `${INFLUX_TOKEN:?}` 的求值 ——
-# 实测表现为「只想跑 panel+headscale，却因为 influx 的必填变量缺失，
-# 整个 compose 报 required variable ... is missing」直接退出。
-# 可选组件的必填校验不该阻塞核心服务启动，故拆成 overlay：
-#
-#   docker compose -f docker-compose.yml -f docker-compose.metrics.yml \
-#                  --profile metrics up -d
 
 name: headscale-admin
 
 services:
-  # ============================================================
-  # 面板
-  # ============================================================
   panel:
-    image: ${PANEL_IMAGE:-headscale-admin:latest}
+    image: ${PANEL_IMAGE:-headscale-admin:1.1.0}
     build:
       context: .
       dockerfile: Dockerfile
       args:
-        # 国内网络可覆盖：NODE_IMAGE=docker.m.daocloud.io/library/node
+        # 国内网络拉不动官方源时覆盖这两项，见 .env.example 的「构建期参数」
         NODE_IMAGE: ${NODE_IMAGE:-node:22-alpine}
         NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmjs.org}
         # 留空 = 沿用 package.json 里的版本（发版后即真版本）。
-        # 若在这里写死默认值，会把真实版本覆盖掉。
+        # 写死默认值会把真实版本覆盖成假值，见 Dockerfile 注释。
         PANEL_VERSION: ${PANEL_VERSION:-}
         VCS_REF: ${VCS_REF:-unknown}
         BUILD_DATE: ${BUILD_DATE:-unknown}
-    container_name: headscale-admin
+
+    container_name: ${PANEL_CONTAINER_NAME:-headscale-admin}
     restart: unless-stopped
 
     env_file:
       - .env
 
     environment:
-      # ---- 必填项：缺失即启动失败，绝不用默认值静默跑一个不安全实例 ----
-      PANEL_MASTER_KEY: ${PANEL_MASTER_KEY:?必须在 .env 里设置 PANEL_MASTER_KEY}
-      PANEL_SESSION_SECRET: ${PANEL_SESSION_SECRET:?必须在 .env 里设置 PANEL_SESSION_SECRET}
+      # ===================== 必填：缺失即退出 =====================
+      PANEL_MASTER_KEY: ${PANEL_MASTER_KEY:?未设置 PANEL_MASTER_KEY（openssl rand -hex 32 生成，设定后不可更改）}
+      PANEL_SESSION_SECRET: ${PANEL_SESSION_SECRET:?未设置 PANEL_SESSION_SECRET（openssl rand -hex 32 生成）}
+      PANEL_PUBLIC_URL: ${PANEL_PUBLIC_URL:?未设置 PANEL_PUBLIC_URL（浏览器实际访问地址，如 https://hs-admin.example.com）}
+      HS_URL: ${HS_URL:?未设置 HS_URL（headscale 地址，见 .env.example 的五种拓扑示例）}
+      HS_API_KEY: ${HS_API_KEY:?未设置 HS_API_KEY（在 headscale 侧执行 headscale apikeys create 生成）}
 
-      # ---- 监听与对外地址 ----
+      # ===================== 监听 =====================
+      # 容器内固定监听 0.0.0.0:3000，不要改；对外端口由 ports 段控制。
       PANEL_HOST: 0.0.0.0
       PANEL_PORT: 3000
-      # issuer 必须与调用方看到的地址完全一致，否则 OIDC 的 iss 校验会失败
-      PANEL_PUBLIC_URL: ${PANEL_PUBLIC_URL:?必须设置面板对外地址，如 https://hs-admin.example.com}
-
-      # ---- 数据目录（挂载到具名卷）----
       PANEL_DATA_DIR: /data
 
-      # ---- Headscale 连接 ----
-      HS_URL: ${HS_URL:-http://headscale:8080}
-      HS_API_KEY: ${HS_API_KEY:?必须设置 HS_API_KEY（headscale apikeys create 生成）}
-      HS_TRANSPORT: rest
+      # ===================== Headscale 连接 =====================
+      # 只支持 REST（v0.26+ 的 /api/v1/*）。保留变量是为了未来兼容。
+      HS_TRANSPORT: ${HS_TRANSPORT:-rest}
+      # ⚠️ 变量名是 HS_TLS_SKIP_VERIFY（对应代码 config.ts 的
+      #    envBool('HS_TLS_SKIP_VERIFY')）。只在对接**自签名证书**的 headscale
+      #    时才设 true；生产请用受信证书，不要图省事关掉校验。
+      HS_TLS_SKIP_VERIFY: ${HS_TLS_SKIP_VERIFY:-false}
+      # 单次请求超时（毫秒）。headscale 卡住时不要无限等。
+      HS_TIMEOUT_MS: ${HS_TIMEOUT_MS:-10000}
 
-      # ---- 时序库（可选；留空则统计降级，不影响核心功能）----
+      # ===================== 时序库（可选）=====================
+      # 留空则统计降级为「无时序库」，核心功能不受影响。
       INFLUX_URL: ${INFLUX_URL:-}
-      INFLUX_ORG: ${INFLUX_ORG:-headscale}
       INFLUX_BUCKET: ${INFLUX_BUCKET:-headscale_admin}
       INFLUX_TOKEN: ${INFLUX_TOKEN:-}
+      # 3.x 已无 org 概念，保留变量只为兼容旧 .env
+      INFLUX_ORG: ${INFLUX_ORG:-headscale}
 
-      # ---- DNS extra-records（可选）----
+      # ===================== DNS extra-records（可选）=====================
+      # 面板写、headscale 读的 JSON 文件路径（容器视角）。
+      # ⚠️ headscale 启动时会 stat 这个路径，文件不存在直接 fatal 退出 ——
+      #    所以对接已有 headscale 时，务必先确认该文件已存在再启用。
       HS_EXTRA_RECORDS_PATH: ${HS_EXTRA_RECORDS_PATH:-}
 
-      # ---- 时区（日志与审计时间可读性）----
       TZ: ${TZ:-Asia/Shanghai}
 
     ports:
-      # 默认只绑本机回环，由前面的 nginx/反向代理对外。
-      # 要直接对外改成 "3000:3000"，但**务必**同时启用 TLS（见 README 安全说明）。
+      # 默认只绑回环，由前面的 nginx/Caddy 终止 TLS 后反代。
+      # 确要直接对外就设 PANEL_BIND=0.0.0.0，但**必须先配好 TLS** ——
+      # http 明传口令，等于把管理员密码广播到网络上。
       - "${PANEL_BIND:-127.0.0.1}:${PANEL_PORT:-3000}:3000"
 
     volumes:
-      # 面板 SQLite + master.key + session.key —— 丢了等于丢所有账号
+      # 面板 SQLite + master.key + session.key。
+      # 丢失 = 所有账号、会话、审计 + 所有加密字段（含 headscale API Key）报废。
       - panel-data:/data
-      # 若启用 DNS extra-records 热加载，且 headscale 在另一个容器里，
-      # 需要让两边共享同一个目录（面板写、headscale 读）
-      - ${DNS_RECORDS_DIR:-./data/dns}:/dns
+      # DNS extra-records 共享目录：面板写、headscale 读。
+      # 对接外部 headscale 时，把这个宿主机目录也让对方的 headscale 挂上，
+      # 或直接把 HS_EXTRA_RECORDS_PATH 指向对方能看到的共享存储。
+      - ${DNS_RECORDS_DIR:-./data/dns}:/dns:z
 
-    depends_on:
-      headscale:
-        condition: service_healthy
+    # 让容器内能用 host.docker.internal 指代宿主机。
+    # 用途：headscale 以**宿主机二进制**方式运行时（HS_URL=http://host.docker.internal:8080）。
+    # Linux 上这个别名不是默认的，必须显式声明；对容器间通信无副作用。
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
     networks:
       - hs-net
 
-    # 容器内不能写 /tmp 之外的地方；只读根文件系统进一步缩小攻击面。
-    # 注意 tmpfs 与 /data 例外必须显式声明，否则 SQLite 与临时文件会写失败。
+    # ---- 安全加固 ----
+    # 只读根文件系统：应用代码不可改，缩小容器逃逸后的破坏面。
+    # /data 是卷、/tmp 与 /run 用 tmpfs，所以不影响正常运行。
     read_only: true
     tmpfs:
       - /tmp:size=64m,mode=1777
       - /run:size=8m,mode=755
-
     security_opt:
       - no-new-privileges:true
-
     cap_drop:
       - ALL
 
     healthcheck:
+      # 用面板自己的健康端点，它同时校验 DB 可达（不只是进程活着）。
+      # 用 node 内置 fetch 而非 curl/wget：镜像里没有这两个，装了也白增体积。
       test:
         - CMD
         - node
@@ -140,52 +162,12 @@ services:
         max-size: "10m"
         max-file: "5"
 
-  # ============================================================
-  # Headscale（如已有实例，删掉本服务并把 HS_URL 指向现有地址）
-  # ============================================================
-  headscale:
-    image: ${HEADSCALE_IMAGE:-headscale/headscale:v0.29.6}
-    container_name: headscale
-    restart: unless-stopped
-
-    command: serve
-    # 官方镜像 ENTRYPOINT 是 headscale 但**没有默认 CMD**，
-    # 不带 `serve` 会打印 help 并 exit 0（容器"成功"启动又立刻停止，极难排查）。
-
-    volumes:
-      - ./config/headscale/config.yaml:/etc/headscale/config.yaml:ro
-      - headscale-data:/var/lib/headscale
-      - ${DNS_RECORDS_DIR:-./data/dns}:/dns
-
-    ports:
-      # 只绑回环：面板经内部网络访问它，不需要对外暴露控制面。
-      # 宿主端口可配（HS_PORT）：宿主上 8080 常被别的服务占着，
-      # 实测就踩过 `Bind for 0.0.0.0:8080 failed: port is already allocated`
-      # 导致 headscale 起不来。容器内端口固定 8080 不动。
-      - "${HS_BIND:-127.0.0.1}:${HS_PORT:-8080}:8080"
-
-    networks:
-      - hs-net
-
-    healthcheck:
-      # 官方镜像是 distroless（无 wget/curl/sh），所以用二进制自己的 health 子命令
-      test: ["CMD", "headscale", "health"]
-      interval: 15s
-      timeout: 5s
-      start_period: 20s
-      retries: 5
-
-    logging:
-      driver: json-file
-      options:
-        max-size: "10m"
-        max-file: "3"
-
 networks:
+  # 面板所在的网络。一体化 overlay 会把 headscale 也接进来，于是
+  # HS_URL 可以用服务名 http://headscale:8080。
   hs-net:
     driver: bridge
 
 volumes:
-  # 面板数据：SQLite + 加密主密钥。**必须备份**，丢了等于丢所有账号
   panel-data:
-  headscale-data:
+    # 丢了等于丢所有账号，务必纳入备份（含 master.key，见部署文档）

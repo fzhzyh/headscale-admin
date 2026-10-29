@@ -1,0 +1,114 @@
+# headscale-admin 生产编排 —— overlay：自带 headscale（一体化部署）
+#
+# ============================================================================
+# 只有在「本机没有 headscale，要让面板顺带把它跑起来」时才叠加这个文件。
+# 对接已有的生产 headscale 时**不要**叠加，直接用 docker-compose.yml。
+# ============================================================================
+#
+# ## 用法
+#
+#   docker compose -f docker-compose.yml -f docker-compose.headscale.yml up -d
+#
+#   或在 .env 里设（之后直接 docker compose up -d）：
+#     COMPOSE_FILE=docker-compose.yml:docker-compose.headscale.yml
+#
+# ## 这个 overlay 做两件事
+#
+#   1. 增加 `headscale` 服务（官方镜像 + 本仓库的 config/headscale/config.yaml）
+#   2. **覆盖 panel 的两处配置**，让一体化场景开箱即用：
+#        HS_URL        补默认值 http://headscale:8080（核心文件里是必填）
+#        depends_on    让 panel 等 headscale 健康后再启动
+#
+#   Compose 的 overlay 语义：同名 key 后者覆盖前者，所以这里只写要改的部分，
+#   其余 panel 配置（安全加固、卷、健康检查）全部继承核心文件。
+#
+# ## 首次部署前必须改 config/headscale/config.yaml
+#
+#   下面三处是占位符，不改会「headscale 起来了但客户端连不上」：
+#
+#     server_url:      https://hs.example.com   ← Tailscale 客户端能访问的地址
+#     dns.base_domain: hs.internal              ← MagicDNS 内部域名
+#     oidc:            默认整段注释掉           ← 需要单点登录时再启用
+#
+#   详细步骤见 docs/deployment.md「场景 B：一体化部署」。
+
+services:
+  panel:
+    # ⚠️ 这里**不能**用 `HS_URL: ${HS_URL:-http://headscale:8080}` 来「补默认值」。
+    #
+    # Compose 的变量插值发生在**每个文件解析时**，不是合并之后。核心文件里
+    # 的 `${HS_URL:?...}` 在解析阶段就会因缺值而失败，overlay 没有机会覆盖它。
+    # 实测：.env 里删掉 HS_URL 后，叠加本 overlay 仍报
+    #   error while interpolating services.panel.environment.HS_URL:
+    #   required variable HS_URL is missing a value
+    #
+    # 所以一体化场景**同样要在 .env 里写 HS_URL**，值固定为：
+    #   HS_URL=http://headscale:8080
+    # 这也是刻意的：宁可报错让人明确知道要连哪里，也不要靠隐式默认值
+    # 让人以为配好了（默认值一旦与实际拓扑不符，故障表现是「启动成功但连不上」，
+    # 比直接报错难查得多）。
+
+    depends_on:
+      # 等 headscale 真正健康（不是「容器已启动」）再起面板。
+      # 否则面板首轮轮询会拿到连接拒绝，虽然会自动重试，
+      # 但日志里会先刷一片红，容易让人以为部署失败。
+      #
+      # 这个覆盖是有效的：核心文件里 panel **没有** depends_on 键，
+      # 所以不存在插值冲突，overlay 可以正常追加。
+      headscale:
+        condition: service_healthy
+
+  headscale:
+    image: ${HEADSCALE_IMAGE:-headscale/headscale:v0.29.6}
+    container_name: ${HS_CONTAINER_NAME:-headscale}
+    restart: unless-stopped
+
+    # ⚠️ 官方镜像的 ENTRYPOINT 是 `headscale` 但**没有默认 CMD**。
+    #    不写 `serve` 会打印 help 然后 exit 0 —— 容器「成功启动」又立刻停止，
+    #    状态显示 Exited (0)，日志只有 usage 文本，非常容易误判成镜像问题。
+    command: serve
+
+    volumes:
+      # 配置：只读挂载。改完需 restart 生效。
+      - ./config/headscale/config.yaml:/etc/headscale/config.yaml:ro
+      # 数据：SQLite、noise key、DERP 私钥。**必须备份**。
+      - headscale-data:/var/lib/headscale
+      # DNS extra-records 共享目录：面板写、headscale 读。
+      # ⚠️ headscale 启动时会 stat /dns/extra-records.json，文件不存在直接
+      #    fatal 退出。所以 config.yaml 里 extra_records_path 默认是注释掉的，
+      #    要启用必须先 `echo '[]' > data/dns/extra-records.json`。
+      - ${DNS_RECORDS_DIR:-./data/dns}:/dns:z
+
+    ports:
+      # 控制面端口。默认只绑回环：面板经内部网络访问它就够了。
+      #
+      # ⚠️ 但**客户端注册需要外部可达**：
+      #    · 若用反代对外（推荐），把 server_url 指向反代，这里保持回环即可
+      #    · 若没有反代、客户端直连，需要改成 "${HS_BIND}:8080" 并把 HS_BIND
+      #      设为 0.0.0.0，同时自己要解决 TLS（见 docs/deployment.md）
+      #
+      # 宿主端口可配（HS_PORT）：8080 是超高频占用端口，实测踩过
+      #   `Bind for 0.0.0.0:8080 failed: port is already allocated`
+      # 导致 headscale 起不来。容器内端口固定 8080 不动。
+      - "${HS_BIND:-127.0.0.1}:${HS_PORT:-8080}:8080"
+
+    networks:
+      - hs-net
+
+    healthcheck:
+      # 官方镜像是 distroless（**无 wget / curl / sh**），所以只能用二进制
+      # 自带的 health 子命令。用 curl 探活会一直失败。
+      test: ["CMD", "headscale", "health"]
+      interval: 15s
+      timeout: 5s
+      start_period: 20s
+      retries: 5
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  headscale-data:

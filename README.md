@@ -94,34 +94,81 @@ TCP 也能建连，但请求一律 `Connection reset by peer`；
 面向**长期运行**的生产环境。与上面的 Apple container 联调环境是两套东西：
 联调环境用 `container/up.sh`，生产用 `docker compose`。
 
-```bash
-# 1. 准备配置（密钥绝不入库）
-cp .env.example .env
-chmod 600 .env
+> **完整部署实施手册见 [`docs/deployment.md`](docs/deployment.md)** ——
+> 覆盖两种拓扑（对接已有生产 headscale / 一体化部署）、TLS 反代、OIDC 单点登录、
+> DNS 对接、备份恢复、升级回滚、故障排查与上线检查清单。
 
-# 2. 生成强密钥并填入 .env
+### 两种部署拓扑
+
+编排文件是**叠加**关系，用 `.env` 里的 `COMPOSE_FILE` 一次声明：
+
+```bash
+# 场景 A：对接已有的生产 headscale（最常见）
+COMPOSE_FILE=docker-compose.yml
+
+# 场景 B：一体化，面板 + headscale 一起部署
+COMPOSE_FILE=docker-compose.yml:docker-compose.headscale.yml
+```
+
+之后统一用 `docker compose up -d` / `down` / `logs`。
+
+### 快速上手（场景 B 一体化）
+
+```bash
+cp .env.example .env && chmod 600 .env
+
+# 生成密钥
 openssl rand -hex 32      # → PANEL_MASTER_KEY
 openssl rand -hex 32      # → PANEL_SESSION_SECRET
-openssl rand -base64 24   # → PANEL_ADMIN_SECRET
 
-# 3. 必填三项（缺失会直接报错退出，不会用默认值静默启动）
-#    PANEL_PUBLIC_URL   浏览器实际访问地址，如 https://hs-admin.example.com
-#    HS_API_KEY         先在 headscale 侧生成（见下）
-#    PANEL_MASTER_KEY / PANEL_SESSION_SECRET
+# 改 config/headscale/config.yaml 的 server_url 与 dns.base_domain（必改）
 
-# 4. 起 headscale，生成 API Key，填回 .env
-docker compose up -d headscale
+mkdir -p data/dns
+docker compose up -d headscale                              # 先起 headscale
 docker compose exec headscale headscale apikeys create --expiration 999d
-
-# 5. 起面板
+#   → 填回 .env 的 HS_API_KEY
 docker compose up -d panel
-docker compose logs -f panel      # 首次会打印管理员账号与口令
-
-# 6.（可选）启用时序库，用于在线时长与趋势曲线
-#     注意：要用 -f 叠加 overlay 文件，不能只靠 --profile
-docker compose -f docker-compose.yml -f docker-compose.metrics.yml \
-               --profile metrics up -d
+docker compose logs -f panel         # 首次打印管理员账号与口令
 ```
+
+### 快速上手（场景 A 对接生产 headscale）
+
+```bash
+cp .env.example .env && chmod 600 .env
+
+# 生成密钥
+openssl rand -hex 32      # → PANEL_MASTER_KEY
+openssl rand -hex 32      # → PANEL_SESSION_SECRET
+
+# 填这 3 项（HS_API_KEY 在现有 headscale 上创建）
+#   PANEL_PUBLIC_URL=https://hs-admin.example.com
+#   HS_URL=https://hs.example.com
+#   HS_API_KEY=hskey-api-...
+
+mkdir -p data/dns
+docker compose up -d
+docker compose logs -f panel
+```
+
+### 启用时序库（可选）
+
+```bash
+# 3.x 没有 2.x 那套自动初始化，admin token 要手工建一次
+docker compose -f docker-compose.yml -f docker-compose.metrics.yml \
+               --profile metrics up -d influxdb
+curl -X POST http://127.0.0.1:8086/api/v3/configure/token/admin
+#   → 把 token 填进 .env 的 INFLUX_TOKEN，再补 INFLUX_URL=http://influxdb:8181
+docker compose up -d panel
+```
+
+### 备份
+
+```bash
+./scripts/backup.sh                  # 热备份（含 master.key）
+./scripts/restore.sh --list          # 查看备份
+```
+
+> ⚠️ 只备份数据库不备份 `master.key` 等于没备份 —— 恢复后所有加密字段解不开。
 
 ### 镜像构建
 
@@ -149,10 +196,16 @@ docker build -t headscale-admin:latest .
 | 健康检查 | 面板自己的 `/api/system/health` | 它同时校验 DB 可达，不只是进程活着 |
 | 版本 | `scripts/set-version.mjs` 从 git tag 同步 | 避免「设置页显示 0.1.0，实际发布 v1.0.0」 |
 
-### 为什么 InfluxDB 单独一个 compose 文件
+### 为什么拆成三个编排文件
 
-Compose 在**解析整个文件**时就做变量插值，`profiles` 是否启用**不影响**
-`${VAR:?}` 的求值。若把 influxdb 放在主文件里，实测会这样：
+| 文件 | 职责 | 谁需要 |
+|---|---|---|
+| `docker-compose.yml` | 面板 | 所有人 |
+| `docker-compose.headscale.yml` | headscale | 只有一体化部署才叠加 |
+| `docker-compose.metrics.yml` | InfluxDB 3.x | 只有要历史曲线才叠加 |
+
+**为什么不合成一个文件**：Compose 在**解析整个文件**时就做变量插值，
+`profiles` 是否启用**不影响** `${VAR:?}` 的求值。实测表现：
 
 ```
 $ docker compose up -d headscale
@@ -161,62 +214,22 @@ required variable INFLUX_TOKEN is missing a value → 退出码 1
 ```
 
 只想跑核心服务，却被可选组件的必填校验挡住，连 headscale 都没起来。
+拆成 overlay 后，每个文件只校验自己真正必需的项。
 
-所以拆成 `docker-compose.metrics.yml`：主文件只校验真正的必需项，
-可选组件的校验推迟到你真要启用它的时候。
+**为什么 panel 不写 `depends_on: headscale`**：面板要能对接**外部** headscale，
+那里没有 `headscale` 服务可依赖。一体化 overlay 才补上这条依赖关系。
 
 ### InfluxDB 3.x 与 2.x 不兼容
 
 | | 2.x | **3.x（当前）** |
 |---|---|---|
-| 端口 | 8086 | **8181**（compose 宿主侧仍映射 8086） |
+| 端口 | 8086 | **8181**（宿主侧仍映射 8086） |
 | 查询 | Flux | **SQL**（Flux 已移除） |
 | 身份 | org + bucket | **database**（无 org） |
 | 建库 | 需预建 bucket | **首次写入自动创建** |
 | 初始化 | `DOCKER_INFLUXDB_INIT_*` 自动 setup | **需手工建一次 admin token** |
 
-首次启用时序库需要三步（一次性）：
-
-```bash
-# 1. 起时序库
-docker compose -f docker-compose.yml -f docker-compose.metrics.yml \
-               --profile metrics up -d influxdb
-
-# 2. 建 admin token（取返回 JSON 的 token 字段，形如 apiv3_...）
-curl -X POST http://127.0.0.1:8086/api/v3/configure/token/admin
-
-# 3. 填进 .env 后重启面板
-#    INFLUX_URL=http://influxdb:8181
-#    INFLUX_TOKEN=apiv3_xxxxx
-#    INFLUX_BUCKET=headscale_admin
-docker compose up -d panel
-```
-
-不内置自动初始化容器：token 是生产密钥，让它静默生成并落在共享卷里，
-比「人看着填一次」更容易出事。
-
-### 必须配 TLS
-
-面板走 `http` 时口令是**明文传输**。生产部署请在前面加 nginx/Caddy 终止 TLS，
-并让 `PANEL_PUBLIC_URL` 与实际访问地址**完全一致**（它是 OIDC 的 issuer，
-不一致会导致 headscale 侧 `iss` 校验失败）。
-
-compose 默认只把端口绑在 `127.0.0.1`，就是强制你走反代。
-
-### 数据备份
-
-`panel-data` 卷里有两个必须备份的文件：
-
-| 文件 | 丢失后果 |
-|---|---|
-| `panel.sqlite` | 所有账号、会话、ACL 版本、审计日志 |
-| `master.key` | **库内所有加密字段解不开**（Headscale API Key、TOTP 密钥、OIDC 私钥） |
-
-```bash
-docker compose exec panel sh -c 'tar czf - /data' > panel-backup-$(date +%F).tar.gz
-```
-
-> 只备份 `panel.sqlite` 而不备份 `master.key` 等于没备份——恢复后加密字段全是废数据。
+启用步骤见[上文](#启用时序库可选)或 [`docs/deployment.md`](docs/deployment.md)。
 
 ## 本地裸进程方式（备选，无容器时）
 

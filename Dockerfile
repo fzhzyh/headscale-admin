@@ -22,14 +22,42 @@
 # 把 /data 的属主给 node 用户即可，无需 root 权限。
 #
 # ## 构建参数
-#   NODE_IMAGE  基础镜像（默认官方；国内可换 docker.m.daocloud.io/library/node）
-#   NPM_REGISTRY npm 源（默认官方；国内可换 npmmirror）
 #
-# 示例：
-#   docker build -t headscale-admin:1.0.0 .
-#   docker build --build-arg NODE_IMAGE=docker.m.daocloud.io/library/node \
-#                --build-arg NPM_REGISTRY=https://registry.npmmirror.com \
-#                -t headscale-admin:1.0.0 .
+#   NODE_IMAGE     基础镜像。默认 node:22-alpine
+#                  ⚠️ **必须带 tag**：不带 tag 会拿到 latest（Debian 版），
+#                     本文件已不依赖包管理器所以能跑，但镜像会大很多。
+#   NPM_REGISTRY   npm 源。默认官方；国内换 https://registry.npmmirror.com
+#   PANEL_VERSION  版本号。**留空 = 沿用 package.json 的版本**（推荐）。
+#                  只有 CI 需要按 git tag 强制对齐时才填。
+#   VCS_REF        git commit，写进 OCI label，便于追查镜像来源
+#   BUILD_DATE     构建时间，同上
+#
+# ## 常用命令
+#
+#   # 基本构建（版本自动取 package.json）
+#   docker build -t headscale-admin:1.1.0 .
+#
+#   # 国内网络（基础镜像与 npm 源都换）
+#   docker build \
+#     --build-arg NODE_IMAGE=docker.m.daocloud.io/library/node:22-alpine \
+#     --build-arg NPM_REGISTRY=https://registry.npmmirror.com \
+#     -t headscale-admin:1.1.0 .
+#
+#   # 多架构（amd64 + arm64），构建机需启用 buildx
+#   docker buildx build --platform linux/amd64,linux/arm64 \
+#     -t registry.example.com/headscale-admin:1.1.0 --push .
+#
+#   # 带来源信息（CI 里用）
+#   docker build \
+#     --build-arg VCS_REF=$(git rev-parse --short HEAD) \
+#     --build-arg BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+#     -t headscale-admin:1.1.0 .
+#
+# ## 构建缓存
+#
+# npm 依赖层与编译产物都尽量走 BuildKit 缓存：改源码不重装依赖，
+# 重复构建通常 10~30 秒完成。需要全新构建时加 --no-cache。
+# ⚠️ 换 NODE_IMAGE 或 NPM_REGISTRY 会让依赖层缓存失效，属预期。
 
 ARG NODE_IMAGE=node:22-alpine
 
@@ -52,8 +80,11 @@ COPY package.json package-lock.json ./
 COPY server/package.json server/package.json
 COPY web/package.json web/package.json
 
-# 用 ci 而非 install：严格按 lockfile，构建可复现
-RUN npm ci --no-audit --no-fund
+# 用 ci 而非 install：严格按 lockfile，构建可复现。
+# --mount=type=cache：把 npm 缓存放到 BuildKit 缓存里而不是镜像层，
+# 重复构建能跳过下载，且不会把缓存留在最终镜像中（省几十 MB）。
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci --no-audit --no-fund
 
 # 再拷源码
 COPY tsconfig.base.json ./
@@ -107,8 +138,10 @@ COPY package.json package-lock.json ./
 COPY server/package.json server/package.json
 COPY web/package.json web/package.json
 
-# --omit=dev 是关键：tsc / vite / playwright 这些都不进运行镜像
-RUN npm ci --omit=dev --no-audit --no-fund && npm cache clean --force
+# --omit=dev 是关键：tsc / vite / playwright 这些都不进运行镜像。
+# 同样走 cache mount：这一层的依赖与 build 阶段有大量重叠，缓存命中率高。
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci --omit=dev --no-audit --no-fund
 
 # ============================================================
 # 阶段 3：运行
