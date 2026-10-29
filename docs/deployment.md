@@ -101,10 +101,10 @@ docker exec headscale headscale apikeys create --expiration 999d
 headscale apikeys create --expiration 999d
 ```
 
-输出形如：
+输出形如（`<前缀>_<密钥>`，总长约 87 字符）：
 
 ```
-hskey-api-1a2b3c4d5e6f_aBcDeFgHiJkLmNoPqRsTuVwXyZ0123456789abcdef
+hskey-api-<prefix>_<secret>
 ```
 
 **只显示这一次**，立刻记下来。
