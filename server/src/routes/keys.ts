@@ -168,8 +168,14 @@ export async function registerKeyRoutes(app: FastifyInstance): Promise<void> {
 
     const tagArgs = tags.map((t) => `--advertise-tags=${t}`).join(' ');
     const hostArg = hostname ? `--hostname=${hostname}` : '';
-    const authArg = key ? `--authkey=${key}` : '--login-server=' + loginServer;
-    const serverArg = key ? '' : '';
+    // --login-server 始终由下面各模板自带（无密钥时它就是唯一能指定控制面的参数）。
+    // 这里只在**有预授权密钥**时追加 --authkey。
+    //
+    // 曾经写成 `key ? '--authkey=' + key : '--login-server=' + loginServer`，
+    // 于是无密钥时生成：
+    //   tailscale up --login-server=X --login-server=X
+    // 参数重复，用户复制执行会失败。authArg 无密钥时必须是空串。
+    const authArg = key ? `--authkey=${key}` : '';
 
     const linuxBringUp = [
       '# 1) 安装 Tailscale（以 Debian/Ubuntu 为例）',
@@ -207,14 +213,16 @@ export async function registerKeyRoutes(app: FastifyInstance): Promise<void> {
         subnetRouter: [
           '# 子网路由（发布内网段，需在「路由管理」里批准）',
           `sudo tailscale up --login-server=${loginServer} ${authArg} --advertise-routes=192.168.0.0/24 ${tagArgs}`.replace(/\s+/g, ' ').trim(),
-          '# 上面命令里的 authArg 若为空，则需先在浏览器完成设备授权',
+          '# 执行后会返回 authId，需在面板「设备管理 → 注册设备」中批准后才能加入网络',
         ].join('\n'),
         exitNode: `sudo tailscale up --login-server=${loginServer} ${authArg} --advertise-exit-node`,
         ssh: sshCmd,
         logout: 'sudo tailscale logout && sudo tailscale down',
       },
       notes: [
-        serverArg === '' ? '使用 PreAuthKey 时无需浏览器授权；使用 --login-server 则需在面板完成设备批准' : '',
+        key
+          ? '已带 --authkey，设备接入后无需浏览器授权，直接生效'
+          : '未带 --authkey：设备执行命令后会返回待批 authId，需在「设备管理 → 注册设备」中批准',
         'MINIMUM: Headscale v0.29.x 要求 Tailscale 客户端版本 ≥ v1.80.0',
         'ACL 未放行时，即使设备已接入也无法互访',
       ].filter(Boolean),

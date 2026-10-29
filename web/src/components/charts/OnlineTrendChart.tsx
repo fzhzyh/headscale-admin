@@ -134,6 +134,10 @@ export function OnlineTrendChart({
 
   const last = rows[rows.length - 1]!;
   const allOffline = last.total > 0 && last.online === 0;
+  // 历史上是否出现过在线——决定下面那句提示该怎么说。
+  // 「曲线贴 0 是正常的」只在**整段窗口都离线**时成立；若窗口里有过在线，
+  // 曲线是有起伏的，再这么说就是自相矛盾的误述。
+  const hadOnlineEver = rows.some((r) => (r.online ?? 0) > 0);
 
   return (
     <div>
@@ -141,7 +145,9 @@ export function OnlineTrendChart({
         <div className="mb-2 rounded-lg bg-ink-50 px-3 py-2 text-[12px] text-ink-600">
           当前 <span className="font-semibold">{last.total}</span> 台设备
           <span className="font-semibold">全部离线</span>。
-          这是真实状态，不是数据缺失——曲线贴 0 是正常的。
+          {hadOnlineEver
+            ? '此刻全部离线是真实状态；图中曲线的起伏来自更早的采样记录。'
+            : '这是真实状态，不是数据缺失——曲线贴 0 是正常的。'}
         </div>
       )}
       <ResponsiveContainer width="100%" height={height}>

@@ -307,21 +307,47 @@ create_admin_token() {
 
 INFLUX_TOKEN="$(tr -d '[:space:]' < "${INFLUX_TOKEN_FILE}" 2>/dev/null || true)"
 
-if influx_probe "${INFLUX_TOKEN}"; then
+# ⚠️ 这里不能「probe 一次失败就当 token 失效」。
+# 实测踩过：容器重建后 IP 会变（如 .3 → .6），probe 用旧 IP 探测失败，
+# 于是走进「创建新 token」分支，而 InfluxDB 里 _admin token 已存在，直接报
+#   ERROR token name already exists, _admin
+# 整个 up.sh 就此 die。实际上旧 token 一直是有效的。
+#
+# 正确做法：已有 token 时先容忍探测失败（重试等 IP/服务就绪），
+# 只有当「确实没有 token」时才算致命。
+if [ -n "${INFLUX_TOKEN}" ] && influx_probe "${INFLUX_TOKEN}"; then
   log "InfluxDB token 有效（沿用 ${INFLUX_TOKEN_FILE}）"
 else
-  [ -n "${INFLUX_TOKEN}" ] && log "旧 token 已失效（数据卷可能被重建），重新创建"
-  NEW_TOKEN="$(create_admin_token)"
-  if [ -z "${NEW_TOKEN}" ]; then
-    echo "---- InfluxDB 日志 ----" >&2
-    container logs "${INFLUX_CTR}" 2>&1 | tail -20 >&2
-    die "创建 InfluxDB admin token 失败（接口无 token 返回，可能是容器内已有其他 token）"
+  if [ -n "${INFLUX_TOKEN}" ]; then
+    log "首次探测失败（容器可能刚起 / IP 变了），重试中…"
+    for _ in 1 2 3 4 5; do
+      sleep 2
+      influx_probe "${INFLUX_TOKEN}" && break
+    done
   fi
-  printf '%s' "${NEW_TOKEN}" > "${INFLUX_TOKEN_FILE}"
-  chmod 600 "${INFLUX_TOKEN_FILE}"
-  INFLUX_TOKEN="${NEW_TOKEN}"
-  influx_probe "${INFLUX_TOKEN}" || die "新创建的 InfluxDB token 仍不可用，检查 /health 认证"
-  ok "已创建 InfluxDB admin token"
+
+  if [ -n "${INFLUX_TOKEN}" ] && influx_probe "${INFLUX_TOKEN}"; then
+    ok "InfluxDB token 有效（重试后确认）"
+  else
+    log "未找到可用 token，尝试创建"
+    NEW_TOKEN="$(create_admin_token)"
+    if [ -n "${NEW_TOKEN}" ]; then
+      printf '%s' "${NEW_TOKEN}" > "${INFLUX_TOKEN_FILE}"
+      chmod 600 "${INFLUX_TOKEN_FILE}"
+      INFLUX_TOKEN="${NEW_TOKEN}"
+      influx_probe "${INFLUX_TOKEN}" || die "新创建的 InfluxDB token 仍不可用，检查 /health 认证"
+      ok "已创建 InfluxDB admin token"
+    elif [ -n "${INFLUX_TOKEN}" ]; then
+      # 创建失败但手里有 token：极可能是「token 已存在」，沿用即可
+      warn "创建新 token 失败（容器内应已有 _admin token），沿用文件中的 token"
+      influx_probe "${INFLUX_TOKEN}" \
+        || die "文件中的 token 也探测不通，检查 hs-influx 容器与 8181 端口"
+    else
+      echo "---- InfluxDB 日志 ----" >&2
+      container logs "${INFLUX_CTR}" 2>&1 | tail -20 >&2
+      die "创建 InfluxDB admin token 失败，且本地无可用 token"
+    fi
+  fi
 fi
 
 ok "InfluxDB 已就绪（${INFLUX_IP}:8181，database=${INFLUX_BUCKET}）"
@@ -458,6 +484,17 @@ if [ -f "${PID_FILE}" ] && kill -0 "$(cat "${PID_FILE}")" 2>/dev/null; then
 fi
 
 log "启动对外转发（${PUB_IP} → 容器）"
+# ⚠️ 必须先清掉上一轮残留的转发进程，否则新进程绑不上端口：
+#     无法绑定 100.64.0.3:8080 —— [Errno 48] Address already in use
+# 典型场景：手动重启过一次转发、或上一轮 up.sh 中途 die 但转发已在跑。
+# PID 文件可能已过期，所以按命令行特征兜底 pkill。
+if [ -f "${PID_FILE}" ]; then
+  OLD_PID="$(cat "${PID_FILE}" 2>/dev/null || true)"
+  [ -n "${OLD_PID}" ] && kill "${OLD_PID}" 2>/dev/null || true
+fi
+pkill -f "lab/hostport.py.*--bind ${PUB_IP}" 2>/dev/null || true
+sleep 1
+
 nohup python3 "${ROOT}/lab/hostport.py" \
   --bind "${PUB_IP}" \
   "${PANEL_PUB_PORT}=${PANEL_IP}:3000" \

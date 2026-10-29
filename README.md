@@ -7,6 +7,34 @@
 
 ---
 
+## 界面一览
+
+> 截图取自真实运行实例：12 台设备、8 条 ACL 规则、InfluxDB 3.x 已接入。
+> 设备显示「离线」是真实状态（合成节点无实际 tailscaled 连接），
+> 趋势图的起伏来自历史采样——面板不会为了让界面好看而伪造在线状态。
+
+[![控制台](docs/images/dashboard.webp)](docs/images/dashboard.webp)
+
+**控制台**：在线趋势（面板每 15 秒采样 → InfluxDB 3.x）、设备在线时长排行、时序库健康状况。
+曲线来自真实采样点，采集断了会直接显示「无数据」而不是画一条假线。
+
+| | |
+|---|---|
+| [![设备管理](docs/images/nodes.webp)](docs/images/nodes.webp) | [![网络拓扑](docs/images/topology.webp)](docs/images/topology.webp) |
+| **设备管理**：状态 / 标签 / 子网路由 / 密钥到期，支持按用户与标签筛选。打标签后归属显示 `tagged-devices`，这是 headscale 的真实语义（标签即身份，脱离原用户） | **网络拓扑**：每一条边都是 ACL 逐对求值的结果（图中 132 对求值出 62 条放行），不是画个示意图 |
+| [![ACL 管理](docs/images/acl.webp)](docs/images/acl.webp) | [![资源中心](docs/images/resources.webp)](docs/images/resources.webp) |
+| **ACL 管理**：可视化编辑 / 原始 HuJSON / 访问矩阵 / 访问检查 / 版本历史五个视角。删除 `acls` 字段会翻成「全通」，所以那一步要求二次确认 | **资源中心**：以「名字 + IP + 端口」登记内部资源，一键同步为 ACL `hosts` 条目。页面顶部明确写了 hosts 只决定「名字指向哪个 IP」，不决定谁能访问 |
+| [![DNS 记录](docs/images/dns.webp)](docs/images/dns.webp) | [![OIDC Provider](docs/images/oidc.webp)](docs/images/oidc.webp) |
+| **DNS 记录**：管理 headscale `extra_records`（仅 A/AAAA），写文件后靠 fsnotify 热生效。页面底部列出了几处硬约束，比如非法 JSON 会让 headscale 直接启动失败 | **OIDC Provider**：面板自己作为认证源，直接生成可粘贴进 headscale 配置的 YAML，含 JWKS 地址与签名密钥轮换 |
+| [![系统设置](docs/images/settings.webp)](docs/images/settings.webp) | [![快速连接](docs/images/connect.webp)](docs/images/connect.webp) |
+| **系统设置**：连接参数以数据库为准，环境变量只用于首次启动引导。API Key 与 InfluxDB Token 以 AES-256-GCM 加密落库，读取时只返回掩码 | **快速连接**：按参数生成接入命令，覆盖 Linux/macOS、Windows、Docker、子网路由、出口节点、Tailscale SSH |
+
+<img src="docs/images/login.webp" width="620" alt="登录">
+
+**登录**：本地账户 + TOTP 双因素。用服务端会话而非纯 JWT，换来「可撤销」——禁用账户或改密后立即踢下线。
+
+---
+
 ## 能力边界（先说清楚，不夸大）
 
 headscale 本身做不到的事，本面板不会假装能做：
