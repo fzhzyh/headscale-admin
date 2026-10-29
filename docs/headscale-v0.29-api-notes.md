@@ -276,7 +276,7 @@ dns:
 
 ```json
 [
-  {"name": "grafana.internal", "type": "A", "value": "100.64.0.3"},
+  {"name": "grafana.internal", "type": "A", "value": "100.64.0.10"},
   {"name": "prom.internal",    "type": "A", "value": "100.64.0.4"}
 ]
 ```

@@ -5,13 +5,13 @@
 #   容器 hs-lab   headscale v0.29.6   :8080 HTTP / :9090 metrics / :50443 gRPC
 #   容器 hs-panel 面板 (Fastify+SPA)   :3000
 #   两者同网络 hs-lab-net，面板按容器名 `hs-lab` 访问 headscale
-#   宿主 lab/hostport.py 把 100.64.0.3:{8080,18080,19090,50443} 转发进容器
+#   宿主 lab/hostport.py 把 $PUBLIC_IP:{8080,18080,19090,50443} 转发进容器
 #
 # ⚠️ 为什么要用宿主转发而不是 `container -p`：
 #   实测 Apple container 1.5.0 的端口发布在本机**不可用**——宿主侧确实 LISTEN、
 #   TCP 也能建连，但请求一律 `Connection reset by peer`（默认网络 / 自定义网络 /
 #   绑定指定 IP / 绑定全接口，四种组合全部复现）。而「宿主 → 容器 IP 直连」完全正常。
-#   因此本脚本用一层极简 TCP 转发绕开，对外地址仍是约定的 100.64.0.3。
+#   因此本脚本用一层极简 TCP 转发绕开，对外地址仍是本机 Tailscale IP。
 #   若哪天 `-p` 修好了，删掉 start_proxy 即可，**测试侧地址不变**。
 set -euo pipefail
 
@@ -28,7 +28,17 @@ INFLUX_CTR="${INFLUX_CONTAINER:-hs-influx}"
 HS_IMAGE_DEFAULT="${HS_IMAGE:-ghcr.io/juanfont/headscale:v0.29.6}"
 PANEL_IMAGE="${PANEL_IMAGE:-headscale-admin-panel:dev}"
 INFLUX_IMAGE="${INFLUX_IMAGE:-docker.m.daocloud.io/library/influxdb:3.12.1-core}"
-PUB_IP="${PUBLIC_IP:-100.64.0.3}"
+# 对外地址：优先用环境变量，其次自动探测本机 Tailscale IP。
+# 不写死具体地址 —— 开源项目不该绑定某个人的 Tailscale 地址。
+PUB_IP="${PUBLIC_IP:-}"
+if [ -z "${PUB_IP}" ]; then
+  PUB_IP="$(tailscale ip -4 2>/dev/null | head -1 || true)"
+  [ -z "${PUB_IP}" ] && PUB_IP="$(command -v tailscale >/dev/null 2>&1 && \
+    tailscale status --json 2>/dev/null | sed -n 's/.*"Self".*"TailscaleIPs":\["\([0-9.]*\)".*/\1/p' | head -1 || true)"
+fi
+[ -n "${PUB_IP}" ] || die "未检测到 Tailscale IP。
+  ⇒ 用环境变量显式指定：PUBLIC_IP=<你的 Tailscale IP> bash container/up.sh
+  ⇒ 或不使用 Tailscale：改为本机局域网 IP，例如 PUBLIC_IP=192.168.1.10"
 
 # InfluxDB 组织/桶（时序数据落这里）
 # 3.x 已无 org 概念；保留变量只为兼容旧 .env，不再注入容器

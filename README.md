@@ -18,7 +18,7 @@ headscale 本身做不到的事，本面板不会假装能做：
 | ACL 版本历史 | ❌ 无 API | 面板自建版本库 |
 | 实时推送 | ❌ 无流式 API | 面板轮询上游 + WebSocket 扇出 |
 | DNS extra_records | ⚠️ 无写 API，但 v0.29 有 fsnotify 文件监听 | 写文件 → 热生效 |
-| 每节点流量字节 | ❌ headscale 不转发数据，物理上统计不到 | 可插拔采集：节点侧 metrics + 外部 NetFlow/sFlow 入库接口 |
+| 每节点流量字节 | ❌ headscale 不转发数据，物理上统计不到 | 接口返回 **501 + 原因说明**，不编造数据；替代方案见下 |
 | 在线时长 | ⚠️ 可从 `online` 状态迁移推算 | 采样器 + InfluxDB，精度 = 采样间隔 |
 
 ---
@@ -54,9 +54,19 @@ headscale 本身做不到的事，本面板不会假装能做：
 
 ---
 
+## 获取代码
+
+```bash
+git clone https://github.com/fzhzyh/headscale-admin.git
+cd headscale-admin
+```
+
+> 生产部署请直接看 [`docs/deployment.md`](docs/deployment.md) —— 覆盖两种拓扑
+> （对接已有 headscale / 一体化部署）、TLS 反代、OIDC、备份恢复、故障排查。
+
 ## 快速开始（容器化，推荐）
 
-联调/测试环境统一跑在 **Apple container** 里，对外访问一律用 **`100.64.0.3`**（本机 Tailscale IP）。
+联调/测试环境统一跑在 **Apple container** 里，对外访问一律用**本机 Tailscale IP**（`container/up.sh` 自动探测，可用 `PUBLIC_IP=` 覆盖）。
 
 ```bash
 container/up.sh        # 拉起 headscale + 面板（首次会构建镜像，约 3~5 分钟）
@@ -67,9 +77,9 @@ container/down.sh --purge   # 停止并清空
 起来之后：
 
 ```
-面板        http://100.64.0.3:8080
-headscale   http://100.64.0.3:18080
-指标        http://100.64.0.3:19090
+面板        http://<TailscaleIP>:8080
+headscale   http://<TailscaleIP>:18080
+指标        http://<TailscaleIP>:19090
 ```
 
 管理员口令见 `container/lab.env`（自动生成，已 gitignore）。
@@ -86,7 +96,7 @@ python3 lab/seed_lab.py --routes     # 2 个用户 + 4 台设备 + 1 条已批�
 实测 Apple container 1.5.0 的端口发布在本机**不可用**：宿主侧确实 LISTEN、
 TCP 也能建连，但请求一律 `Connection reset by peer`；
 而「宿主 → 容器 IP 直连」完全正常。
-因此用 `lab/hostport.py` 做一层透明 TCP 转发，对外地址仍是约定的 `100.64.0.3`。
+因此用 `lab/hostport.py` 做一层透明 TCP 转发，对外地址仍是本机 Tailscale IP。
 若上游修好了，删掉转发层即可，**测试侧地址不变**。
 
 ## 生产部署（Docker Compose，推荐用于正式环境）
@@ -290,7 +300,7 @@ npm run dev
 
 ---
 
-## 交付进度
+## 功能范围与验证
 
 | 阶段 | 内容 | 状态 |
 |------|------|------|
@@ -302,7 +312,11 @@ npm run dev
 | **P5** | **资源中心**、**DNS extra-records 热加载**、**内置 OIDC Provider**（RS256 + JWKS + 授权码流 + PKCE） | ✅ 已完成 |
 | **不做** | 外部 OIDC 登录（按需求明确排除） | — |
 
-### 已验证（共 577 项用例，全通过）
+### 已验证（716 项通过 / 3 项因环境限制显式 SKIP）
+
+⚠️ 那 3 项 SKIP 不是「跑不过就跳过」，而是容器化后 `/debug/*` 仅限本机回环、
+官方镜像又是 distroless 无法 exec 进去，因此**显式声明跳过并写明原因**，
+绝不伪装成通过。裸进程模式下可完整跑。
 
 | 脚本 | 项数 | 覆盖 |
 |------|------|------|
@@ -310,20 +324,19 @@ npm run dev
 | `lab/e2e_2fa.py` | 25 | TOTP 生成/校验、两步登录、错误码拒绝、恢复码一次性、关闭 2FA 需口令确认（动态码由**独立手写的 RFC 6238 实现**生成，交叉验证 otplib 输出） |
 | `lab/verify_web.mjs` | 23 | 登录页渲染、登录跳转、控制台真实数据、设备表格数据行、七个页面可达性、移动端无横向溢出、无 JS 运行时错误（Chromium 真实 DOM 断言） |
 | `server/src/auth/secrets.test.ts` | 39 | 口令哈希与强度、TOTP 密钥/URI/校验、**共享单例污染回归**（先校验动态码再生成密钥，防止 2FA setup 永久 500）、恢复码一次性消费、引导口令生成 |
+| `server/src/acl/evaluator.test.ts` | 56 | 自研 ACL 求值引擎：`{}` 全通 vs `{"acls":[]}` 全禁的语义区分、`tag:exit` 的 `0.0.0.0/0` 不被当普通 CIDR、`autogroup:internet` 仅对出口节点成立、别名/组/self 解析边界 |
 | `lab/verify_ws.py` | 18 | WS 握手与订阅、心跳、未认证拒绝（error 帧 + 4401 关闭）、**写操作触发实时推送**（节点/路由） |
-| `lab/e2e_acl.py` | 93 | 策略读写与漂移检测、本地校验拦住 10 类非法策略、**高危护栏**（全通↔全禁必须显式确认，并用 `/debug/filter` 验证上游编译结果真的变了）、**标签不可逆语义**、访问检查 9 类边界、版本历史/差异/回滚、权限拦截。测试**自建自清**一次性设备（因打标签不可逆） |
-| `lab/verify_acl_ui.mjs` | 33 | ACL 页真实 DOM 断言：五个标签页、可视化编辑器四个区块、**非法策略触发错误且两处「应用策略」按钮同步禁用**、访问矩阵格子渲染、访问检查交互求值、版本表格、无运行时错误 |
-| `lab/verify_acl_semantics.py` | 6 | 面板求值结论与上游 `/debug/filter` 编译结果**交叉验证**（含 `{}` vs `{"acls":[]}` 的危险区分）。容器模式下整体 SKIP（该端点仅限本机回环） |
+| `lab/e2e_acl.py` | 91 | 策略读写与漂移检测、本地校验拦住 10 类非法策略、**高危护栏**（全通↔全禁必须显式确认，并用 `/debug/filter` 验证上游编译结果真的变了）、**标签不可逆语义**、访问检查 9 类边界、版本历史/差异/回滚、权限拦截。测试**自建自清**一次性设备（因打标签不可逆） |
+| `lab/verify_acl_ui.mjs` | 40 | ACL 页真实 DOM 断言：五个标签页、可视化编辑器四个区块、**非法策略触发错误且两处「应用策略」按钮同步禁用**、访问矩阵格子渲染、访问检查交互求值、版本表格、无运行时错误 |
+| `lab/verify_acl_semantics.py` | 6（SKIP） | 面板求值结论与上游 `/debug/filter` 编译结果**交叉验证**（含 `{}` vs `{"acls":[]}` 的危险区分）。容器模式下整体 SKIP（该端点仅限本机回环） |
 | `server/src/timeseries/influx.test.ts` | 30 | line protocol 转义/类型/空 field 丢弃、**3.x SQL JSON 解析**、**time 缺时区补 Z**（含幂等与毫秒用例）、查询失败返回纯文本时的降级 |
-| `lab/verify_stats_ui.mjs` | 28 | 趋势图真实 svg/图例/坐标轴/面积层/**折线层**、时序库自检显示真实写入计数、时长表列头与实际观测区间、窗口切换、**「流量不可得」是否如实告知**、无运行时异常 |
+| `lab/verify_stats_ui.mjs` | 35 | 趋势图真实 svg/图例/坐标轴/面积层/**折线层**、时序库自检显示真实写入计数、时长表列头与实际观测区间、窗口切换、**「流量不可得」是否如实告知**、无运行时异常 |
 | `server/src/services/metrics.test.ts` | 38 | 路径归一化（`/api/nodes/123` → `/:id`，令牌段 → `/:key`）、状态分类、**无请求时 errorRate 为 null 而非 0**、分位边界（单样本/零样本）、指标接口自身不计入（防自我放大）、NaN 耗时安全处理 |
 | `server/src/oidc/keys.test.ts` | 51 | 私钥 AES-GCM 加密落库、**JWKS 不含 d/p/q/dp/dq/qi**、签发即自验、aud/iss 交叉校验、claims 齐全、**轮换后旧 token 仍可验签**（按 kid 选公钥）、强制退役的预期代价 |
-| `lab/verify_oidc.py` | 79 | 发现文档与 JWKS 无会话可访问、**管理端点必须需要会话**（早期 `startsWith('/api/oidc/')` 是漏洞）、redirect_uri 精确匹配防开放重定向、未登录跳登录页、**完整授权码流转 + PKCE S256**、**code 一次性防重放**、verifier/secret 错误拒绝、refresh + userinfo、密钥轮换 |
+| `lab/verify_oidc.py` | 84 | 发现文档与 JWKS 无会话可访问、**管理端点必须需要会话**（早期 `startsWith('/api/oidc/')` 是漏洞）、redirect_uri 精确匹配防开放重定向、未登录跳登录页、**完整授权码流转 + PKCE S256**、**code 一次性防重放**、verifier/secret 错误拒绝、refresh + userinfo、密钥轮换 |
 | `lab/verify_dns.py` | 43 | A/AAAA 类型与值必须匹配、域名与通配符校验、应用后文件与库一致、**每段都断言文件仍是合法 JSON**（非法会让 headscale 启动 fatal）、手改文件必须 409 确认、**删除后直接 apply 不被误判为手改**（回归）、文件快照区分「自己的删除」与「他人手改」 |
 | `lab/verify_resources.py` | 54 | 资源名校验（挡 ACL 身份语法 `tag:`/`user@`）、IP/CIDR 与端口区间校验、**端口不进 hosts 的职责分离**、同步**逐字节断言 acls 未变**、冲突必须 409 而非静默覆盖、`overwrite` 才改写、参考规则按 ownerGroup 推导且不自动应用、删除时可选清理 hosts |
 | `lab/verify_topology_ui.mjs` | 32 | 拓扑画布与节点数、**边数与 ACL 语义一致**（全通 12 条 → 限制性策略精确 4 条且方向无反边）、**高危护栏 409 NEED_ACK**、全通/全禁不画 N² 箭头、只看在线过滤、语义说明诚实性 |
-
-另有 `server/src/acl/evaluator.test.ts` 56 项 ACL 求值单元测试。
 
 > **能力边界（重要）**：**设备流量统计在当前架构下不可得**。
 > headscale 是控制面，只协调握手与下发 ACL/路由；设备之间的数据面流量由
@@ -383,4 +396,7 @@ ACL 相关的语义陷阱（`{}` 与 `{"acls":[]}` 语义相反、打标签不�
 
 ## 许可
 
-内部项目。Headscale 为 BSD-3-Clause，本面板为其独立客户端，不包含 headscale 代码。
+[MIT](LICENSE)
+
+本面板是 Headscale 的独立客户端，**不包含 headscale 代码**。Headscale 本身
+以 BSD-3-Clause 授权，与本项目的许可互不影响。

@@ -1,6 +1,6 @@
 # 容器化开发/测试环境（Apple container）
 
-用 Apple 原生 `container` 跑 headscale + 面板，**对外统一走 `100.64.0.3`**（本机 Tailscale IP）。
+用 Apple 原生 `container` 跑 headscale + 面板，**对外统一走本机 Tailscale IP**（脚本自动探测，可用 `PUBLIC_IP=` 覆盖）。
 测试脚本不再连 `127.0.0.1` —— 容器化后服务不在宿主回环上，且只有走真实对外地址
 才能顺带验证「发布是否真的通」。
 
@@ -22,10 +22,10 @@ container/down.sh --purge             # 停止并清空数据/密钥
 ## 架构
 
 ```
-                        宿主 macOS 27.0.1 / arm64
-                        Tailscale IP: 100.64.0.3 (macmini-home)
+                        宿主 macOS / arm64
+                        Tailscale IP: $PUBLIC_IP（默认自动探测）
                                     │
-              lab/hostport.py  ←────┴────→  100.64.0.3:{8080,18080,19090,50443}
+              lab/hostport.py  ←────┴────→  $PUBLIC_IP:{8080,18080,19090,50443}
                     （TCP 转发，见下文"为什么需要"）
                                     │
         ┌───────────────────────────┴───────────────────────────┐
@@ -40,7 +40,7 @@ container/down.sh --purge             # 停止并清空数据/密钥
 ```
 
 - **面板 → headscale 走容器名** `http://hs-lab:8080`：不依赖宿主 IP，容器重建也不受影响
-- **测试 → 服务走 `100.64.0.3`**：与真实使用者路径一致
+- **测试 → 服务走本机 Tailscale IP**：与真实使用者路径一致
 - 数据持久化在 `container/state/`（headscale SQLite、面板 SQLite、API Key）
 
 ## 为什么需要 `lab/hostport.py`（而不是 `container -p`）
@@ -49,7 +49,7 @@ container/down.sh --purge             # 停止并清空数据/密钥
 
 | 测试 | 结果 |
 |------|------|
-| `container -p 100.64.0.3:18099:80` | 宿主 `LISTEN` ✓，但 HTTP 请求 `Connection reset by peer` ✗ |
+| `container -p <TailscaleIP>:18099:80` | 宿主 `LISTEN` ✓，但 HTTP 请求 `Connection reset by peer` ✗ |
 | `container -p 18098:80`（全接口） | 同样 reset ✗ |
 | 默认网络 / 自定义网络 | 都是 reset ✗ |
 | `container system stop && start` 后复测 | 仍然 reset ✗ |
@@ -59,7 +59,7 @@ container/down.sh --purge             # 停止并清空数据/密钥
 **若将来 `-p` 修好，删掉 `start_proxy` 即可，测试侧地址不变。**
 
 选 `hostport.py` 而不用 `tailscale serve` 的原因：`serve` 是 HTTP/HTTPS 导向、
-会给出 `*.ts.net` 域名，与「统一用 `100.64.0.3`」的约定不符；
+会给出 `*.ts.net` 域名，与「统一用本机 Tailscale IP」的约定不符；
 而且面板的实时推送是 WebSocket，需要透明 TCP 转发。
 
 ## 本次踩到的坑（都已修复，改代码前值得看）
@@ -216,8 +216,8 @@ headscale 的 debug 端点仅允许**本机回环**访问。容器化后请求�
 
 ### 13. 实验网段的节点 IP 与宿主 Tailscale IP 重叠
 
-headscale 从 `100.64.0.0/10` 分配，实验里 `lab-beta` 拿到了 **`100.64.0.3`**，
-正好是本机的 Tailscale 地址。
+headscale 从 `100.64.0.0/10` 分配，实验里 `lab-beta` 曾拿到**与本机 Tailscale
+IP 完全相同**的地址。
 
 对**纯控制面实验**无害（headscale 不向节点转发数据流量，节点也是合成的、从不存在真实客户端），
 但**绝不能往这套实验环境接真实 Tailscale 客户端**，否则会与本机路由冲突。

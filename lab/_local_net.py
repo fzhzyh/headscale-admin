@@ -112,7 +112,7 @@ def load_hs_key(env_file: str | pathlib.Path = "server/.env") -> str:
 def load_endpoints(env_file: str | pathlib.Path = "container/endpoints.env") -> dict[str, str]:
     """取得联调环境各服务的**对外地址**。
 
-    统一约定：测试一律访问 `100.64.0.3:<port>`，不直接写 127.0.0.1。
+    统一约定：测试一律访问**对外 IP**（本机 Tailscale IP），不直接写 127.0.0.1。
     原因有两个：
       1. 容器化后服务不再跑在宿主回环上，127.0.0.1 根本连不到
       2. 对外地址就是真实使用者的访问路径，拿它做测试才能同时验证
@@ -120,10 +120,15 @@ def load_endpoints(env_file: str | pathlib.Path = "container/endpoints.env") -> 
 
     地址由 `container/up.sh` 写入 `container/endpoints.env`。
     """
+    # 兜底地址：优先用 PUBLIC_IP（与 container/up.sh 同一个变量），
+    # 都没有时留空 —— 让缺失显式暴露，而不是静默连一个猜出来的地址。
+    # 正常情况下这些值会被下面读到的 container/endpoints.env 覆盖。
+    public_ip = os.environ.get("PUBLIC_IP", "")
+    _mk = (lambda port: f"http://{public_ip}:{port}") if public_ip else (lambda port: "")
     defaults = {
-        "PANEL_URL": "http://100.64.0.3:8080",
-        "HS_URL": "http://100.64.0.3:18080",
-        "HS_DEBUG_URL": "http://100.64.0.3:19090",
+        "PANEL_URL": _mk(8080),
+        "HS_URL": _mk(18080),
+        "HS_DEBUG_URL": _mk(19090),
     }
     here = pathlib.Path(__file__).resolve().parent
     for base in (here.parent, here, pathlib.Path.cwd()):
