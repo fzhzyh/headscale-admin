@@ -17,7 +17,7 @@ import type { FastifyInstance, FastifyRequest } from 'fastify';
 import type { WebSocket } from 'ws';
 import type { AuthContext } from '../auth/session.ts';
 import { loadSession } from '../auth/session.ts';
-import { hs } from '../services/headscale.ts';
+import { cachedNodes } from '../services/hs-cache.ts';
 import { getBool, getInt } from '../services/settings.ts';
 import { isNeverExpiring } from '../routes/nodes.ts';
 import { nowIso } from '../util/time.ts';
@@ -167,7 +167,9 @@ export interface PollResult {
  * 同时作为时序采样的数据来源（P4 会在此基础上落 InfluxDB）。
  */
 export async function pollOnce(): Promise<PollResult> {
-  const nodes = (await hs().listNodes()) as unknown as NodeLike[];
+  // force=true：采样器是「在线状态」的权威来源，必须拿最新值；
+  // 同时它会把结果写回共享缓存，页面查询随即复用这一份，避免重复拉取。
+  const nodes = (await cachedNodes({ force: true })) as unknown as NodeLike[];
 
   // ---------- 时序采样 ----------
   // 放在差异计算之前：采样是「记录事实」，不该因为后面的推送逻辑异常而漏采。

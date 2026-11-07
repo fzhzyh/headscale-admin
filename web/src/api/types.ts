@@ -476,8 +476,9 @@ export interface StatsOverviewNode {
   lastOnline: boolean;
   sampleRatio: number | null;
   sampleCount: number;
-  observedFrom: string;
-  observedTo: string;
+  /** 面板实际采到数据的起点；理论上不会为空，为空表示该节点没有有效时间戳 */
+  observedFrom: string | null;
+  observedTo: string | null;
 }
 
 export interface StatsOverview {
@@ -508,6 +509,19 @@ export interface TopologyNode {
   approvedRoutes: string[];
   /** 标签设备已脱离用户归属，展示上要区分 */
   identity: 'user' | 'tagged';
+  /**
+   * 与全部在线设备的互通状态（后端按「双向放行」判定）：
+   *   ok      → 绿：可访问全部在线设备，且全部在线设备也可访问它
+   *   partial → 橙：存在无法互通的在线设备（悬浮时高亮这些设备）
+   *   offline → 灰：设备离线，不参与判定
+   */
+  reachStatus: 'ok' | 'partial' | 'offline';
+  /** 无法互通的在线设备总数（明细可能被后端截断，此值始终精确） */
+  unreachableCount: number;
+  /** 无法互通的在线设备 ID 列表（最多 100 条，用于悬停高亮） */
+  unreachableIds: number[];
+  /** 逐对给出的不通原因（悬浮时解释「为什么不通」） */
+  unreachableReasons: { id: number; name: string; reason: string }[];
 }
 
 export interface TopologyEdge {
@@ -519,24 +533,31 @@ export interface TopologyEdge {
 }
 
 export interface TopologyResponse {
-  /** allow-all / deny-all 时不画边，由 mode 表达结论 */
+  /** allow-all / deny-all 时由 mode 表达结论，不画逐对连线 */
   mode: 'allow-all' | 'deny-all' | 'rules';
   explanation: string;
   highImpact: boolean;
   source: string;
+  /** 树状拓扑的第一层根节点（由后端下发，前端不写死文案） */
+  vpc: { id: string; label: string; subLabel: string };
   nodes: TopologyNode[];
+  /** 逐对 ACL 放行关系。树状图**不渲染**它，仅用于交叉核对与脚本验证 */
   edges: TopologyEdge[];
   users: { name: string; deviceCount: number }[];
   stats: {
     nodeCount: number;
+    onlineCount: number;
+    okCount: number;
+    partialCount: number;
+    offlineCount: number;
     consideredCount: number;
     pairEvaluated: number;
     allowedEdges: number;
     maxPairs: number;
-    /** 设备过多导致逐对求值被截断——未算过的组合不会出现在图上 */
+    /** 设备过多导致逐对求值被截断——截断范围内保守判为「可能不通」 */
     truncated: boolean;
   };
-  notes: { edges: string; traffic: string };
+  notes: { edges: string; status: string; traffic: string };
 }
 
 // ============================================================

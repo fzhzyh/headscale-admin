@@ -29,7 +29,8 @@ function fmtDur(sec: number): string {
   return rm > 0 ? `${h} 小时 ${rm} 分` : `${h} 小时`;
 }
 
-function fmtClock(iso: string): string {
+function fmtClock(iso: string | null): string {
+  if (!iso) return '—';
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return '—';
   const hh = String(d.getHours()).padStart(2, '0');
@@ -142,8 +143,8 @@ export function NodeUptimeTable({
       ),
       key: 'window',
       render: (_: unknown, r) => {
-        const from = new Date(r.observedFrom).getTime();
-        const to = new Date(r.observedTo).getTime();
+        const from = r.observedFrom ? new Date(r.observedFrom).getTime() : NaN;
+        const to = r.observedTo ? new Date(r.observedTo).getTime() : NaN;
         const dur = Number.isFinite(from) && Number.isFinite(to) ? Math.max(0, Math.round((to - from) / 1000)) : 0;
         return (
           <div className="text-[12px] leading-tight">

@@ -11,6 +11,19 @@
  * 便于将来 headscale 升版时集中适配。
  */
 
+/**
+ * 写操作纪元。
+ *
+ * 用途：给「上游读缓存」提供失效依据。
+ * 任何非 GET 请求成功后就自增——缓存里记着取数时的纪元值，
+ * 纪元一变即视为过期。这样**所有写操作自动让缓存失效**，
+ * 不需要在每个写路由里手工调一次 invalidate（漏一个就是脏数据）。
+ */
+let writeEpoch = 0;
+export function currentWriteEpoch(): number {
+  return writeEpoch;
+}
+
 export class HeadscaleError extends Error {
   constructor(
     message: string,
@@ -142,6 +155,9 @@ export class HeadscaleClient {
       const { code, message, body } = parseError(res.status, text);
       throw new HeadscaleError(message, res.status, code, body);
     }
+    // 写成功 → 上游数据已变，让读缓存整体失效
+    if (method !== 'GET') writeEpoch += 1;
+
     if (!text) return {} as T;
     try {
       return JSON.parse(text) as T;

@@ -1,6 +1,6 @@
 # headscale-admin
 
-基于 **Headscale v0.29.6** 的 Web 管理面板。应用 / 系统 / 网络三层统一运维入口。
+基于 **Headscale v0.29.x** 的 Web 管理面板（一体化部署内置 v0.29.7）。应用 / 系统 / 网络三层统一运维入口。
 
 > 所有 API 用法均在真实 headscale v0.29.6 实例上实测验证，踩坑记录见
 > [`docs/headscale-v0.29-api-notes.md`](docs/headscale-v0.29-api-notes.md)。
@@ -21,7 +21,7 @@
 | | |
 |---|---|
 | [![设备管理](docs/images/nodes.webp)](docs/images/nodes.webp) | [![网络拓扑](docs/images/topology.webp)](docs/images/topology.webp) |
-| **设备管理**：状态 / 标签 / 子网路由 / 密钥到期，支持按用户与标签筛选。打标签后归属显示 `tagged-devices`，这是 headscale 的真实语义（标签即身份，脱离原用户） | **网络拓扑**：每一条边都是 ACL 逐对求值的结果（图中 132 对求值出 62 条放行），不是画个示意图 |
+| **设备管理**：状态 / 标签 / 子网路由 / 密钥到期，支持按用户与标签筛选。打标签后归属显示 `tagged-devices`，这是 headscale 的真实语义（标签即身份，脱离原用户） | **网络拓扑**：两层树。第一层是 WireGuard 虚拟专用网络（VPC），第二层是各自接入 VPC 的设备，设备之间不连线。绿 = 与全部在线设备双向可达，橙 = 存在不通设备（悬停高亮），灰 = 离线 |
 | [![ACL 管理](docs/images/acl.webp)](docs/images/acl.webp) | [![资源中心](docs/images/resources.webp)](docs/images/resources.webp) |
 | **ACL 管理**：可视化编辑 / 原始 HuJSON / 访问矩阵 / 访问检查 / 版本历史五个视角。删除 `acls` 字段会翻成「全通」，所以那一步要求二次确认 | **资源中心**：以「名字 + IP + 端口」登记内部资源，一键同步为 ACL `hosts` 条目。页面顶部明确写了 hosts 只决定「名字指向哪个 IP」，不决定谁能访问 |
 | [![DNS 记录](docs/images/dns.webp)](docs/images/dns.webp) | [![OIDC Provider](docs/images/oidc.webp)](docs/images/oidc.webp) |
@@ -66,7 +66,7 @@ headscale 本身做不到的事，本面板不会假装能做：
      │ REST         │ 写文件        │ line protocol
      ▼              ▼              ▼
  Headscale      extra-records   InfluxDB 3.x
- v0.29.6       (fsnotify 热加载)  (未配置则降级 SQLite)
+ v0.29.x       (fsnotify 热加载)  (未配置则降级 SQLite)
 ```
 
 ## 技术选型与取舍
@@ -144,13 +144,17 @@ TCP 也能建连，但请求一律 `Connection reset by peer`；
 # 场景 A：对接已有的生产 headscale（最常见）
 COMPOSE_FILE=docker-compose.yml
 
-# 场景 B：一体化，面板 + headscale 一起部署
+# 场景 B：一体化，headscale + 面板跑在**同一个容器**里
 COMPOSE_FILE=docker-compose.yml:docker-compose.headscale.yml
 ```
 
 之后统一用 `docker compose up -d` / `down` / `logs`。
 
-### 快速上手（场景 B 一体化）
+### 快速上手（场景 B 一体化单容器）
+
+镜像以官方 `headscale/headscale:v0.29.7` 为基底，把 Node 运行时与面板产物
+注入同一个 distroless 镜像；`scripts/allinone-supervisor.mjs` 作为 PID 1
+托管两个进程，任一退出即重启整个容器。详见 `Dockerfile.allinone`。
 
 ```bash
 cp .env.example .env && chmod 600 .env
@@ -159,15 +163,21 @@ cp .env.example .env && chmod 600 .env
 openssl rand -hex 32      # → PANEL_MASTER_KEY
 openssl rand -hex 32      # → PANEL_SESSION_SECRET
 
-# 改 config/headscale/config.yaml 的 server_url 与 dns.base_domain（必改）
+# .env 里固定这几项（同一个容器走回环，没有 headscale 服务名）
+#   HS_URL=http://127.0.0.1:8080
+#   HS_API_KEY=auto        # 首次启动由监督器自动建 key 并存到 /data
+#   PANEL_ADMIN_USER / PANEL_ADMIN_SECRET  # 可选，指定初始管理员口令
 
-mkdir -p data/dns
-docker compose up -d headscale                              # 先起 headscale
-docker compose exec headscale headscale apikeys create --expiration 999d
-#   → 填回 .env 的 HS_API_KEY
-docker compose up -d panel
+# 改 config/headscale/config.yaml 的 server_url 与 dns.base_domain（必改）
+# 配置文件需容器可读（cap_drop ALL 下补了 DAC_OVERRIDE，详见 overlay 注释）
+
+mkdir -p data/dns && echo '[]' > data/dns/extra-records.json
+docker compose up -d --build
 docker compose logs -f panel         # 首次打印管理员账号与口令
 ```
+
+菜单里的 3000（面板）、8080（headscale）、3478/udp（内置 DERP STUN）
+都在同一个容器上。备份要同时带上 `panel-data` 与 `headscale-data` 两个卷。
 
 ### 快速上手（场景 A 对接生产 headscale）
 
@@ -239,14 +249,14 @@ docker build -t headscale-admin:latest .
 | 文件 | 职责 | 谁需要 |
 |---|---|---|
 | `docker-compose.yml` | 面板 | 所有人 |
-| `docker-compose.headscale.yml` | headscale | 只有一体化部署才叠加 |
+| `docker-compose.headscale.yml` | 把 `panel` 覆盖为「headscale v0.29.7 + 面板」单容器（`Dockerfile.allinone`） | 只有一体化部署才叠加 |
 | `docker-compose.metrics.yml` | InfluxDB 3.x | 只有要历史曲线才叠加 |
 
 **为什么不合成一个文件**：Compose 在**解析整个文件**时就做变量插值，
 `profiles` 是否启用**不影响** `${VAR:?}` 的求值。实测表现：
 
 ```
-$ docker compose up -d headscale
+$ docker compose up -d panel
 error while interpolating services.influxdb.environment.DOCKER_INFLUXDB_INIT_ADMIN_TOKEN:
 required variable INFLUX_TOKEN is missing a value → 退出码 1
 ```
@@ -255,7 +265,8 @@ required variable INFLUX_TOKEN is missing a value → 退出码 1
 拆成 overlay 后，每个文件只校验自己真正必需的项。
 
 **为什么 panel 不写 `depends_on: headscale`**：面板要能对接**外部** headscale，
-那里没有 `headscale` 服务可依赖。一体化 overlay 才补上这条依赖关系。
+那里没有 `headscale` 服务可依赖。一体化 overlay 也不再需要它 —— 两个进程在
+同一个容器里，启动顺序由监督器保证，而不是由 Compose 的服务依赖保证。
 
 ### InfluxDB 3.x 与 2.x 不兼容
 
@@ -335,7 +346,7 @@ npm run dev
 | **P1** | 仓库骨架、加密存储、Headscale REST 客户端、认证/RBAC/2FA、审计、设备/用户/密钥/路由/设置 | ✅ 已完成 |
 | **P2** | 实时推送（WebSocket）、前端 SPA（控制台、设备、用户、密钥、路由、账户角色、快速连接、审计、设置） | ✅ 已完成 |
 | **P3** | ACL 引擎：可视化编辑、原始 HuJSON、版本历史、访问检查求值器、访问矩阵、AI 辅助 | ✅ 已完成 |
-| **P4** | 监控：InfluxDB 时序采样、在线状态/在线时长、趋势图、**网络拓扑（ACL 逐对求值）** | ✅ 已完成 |
+| **P4** | 监控：InfluxDB 时序采样、在线状态/在线时长、趋势图、**树状网络拓扑（VPC → 设备，ACL 逐对求值决定三态）** | ✅ 已完成 |
 | **P4+** | 面板自身控制面指标（API 吞吐/错误率/延迟分位/WS 推送量） | ✅ 已完成 |
 | **P5** | **资源中心**、**DNS extra-records 热加载**、**内置 OIDC Provider**（RS256 + JWKS + 授权码流 + PKCE） | ✅ 已完成 |
 | **不做** | 外部 OIDC 登录（按需求明确排除） | — |
@@ -364,7 +375,7 @@ npm run dev
 | `lab/verify_oidc.py` | 84 | 发现文档与 JWKS 无会话可访问、**管理端点必须需要会话**（早期 `startsWith('/api/oidc/')` 是漏洞）、redirect_uri 精确匹配防开放重定向、未登录跳登录页、**完整授权码流转 + PKCE S256**、**code 一次性防重放**、verifier/secret 错误拒绝、refresh + userinfo、密钥轮换 |
 | `lab/verify_dns.py` | 43 | A/AAAA 类型与值必须匹配、域名与通配符校验、应用后文件与库一致、**每段都断言文件仍是合法 JSON**（非法会让 headscale 启动 fatal）、手改文件必须 409 确认、**删除后直接 apply 不被误判为手改**（回归）、文件快照区分「自己的删除」与「他人手改」 |
 | `lab/verify_resources.py` | 54 | 资源名校验（挡 ACL 身份语法 `tag:`/`user@`）、IP/CIDR 与端口区间校验、**端口不进 hosts 的职责分离**、同步**逐字节断言 acls 未变**、冲突必须 409 而非静默覆盖、`overwrite` 才改写、参考规则按 ownerGroup 推导且不自动应用、删除时可选清理 hosts |
-| `lab/verify_topology_ui.mjs` | 32 | 拓扑画布与节点数、**边数与 ACL 语义一致**（全通 12 条 → 限制性策略精确 4 条且方向无反边）、**高危护栏 409 NEED_ACK**、全通/全禁不画 N² 箭头、只看在线过滤、语义说明诚实性 |
+| `lab/verify_topology_ui.mjs` | 38 | 树状画布与节点数、**唯一 VPC 根节点 / 边数 = 设备数 / 设备之间不连线**、绿橙灰三态与悬停高亮、**高危护栏 409 NEED_ACK**、只看在线过滤、语义说明诚实性 |
 
 > **能力边界（重要）**：**设备流量统计在当前架构下不可得**。
 > headscale 是控制面，只协调握手与下发 ACL/路由；设备之间的数据面流量由

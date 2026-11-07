@@ -81,7 +81,8 @@ dns:
   #
   # 启用步骤：
   #   echo '[]' > data/dns/extra-records.json     # 必须先建空数组
-  #   去掉下面这行的注释，docker compose restart headscale
+  #   去掉下面这行的注释，docker compose restart panel
+#   （场景 B 是单容器，重启 panel 服务会同时重启 headscale 与面板）
   #
   # 另两个坑：
   #   · 与 inline 的 extra_records 互斥，同时配置会 fatal 退出

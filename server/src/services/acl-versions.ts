@@ -17,6 +17,7 @@
 import { all, get, run, tx } from '../db/index.ts';
 import { nowIso } from '../util/time.ts';
 import { hs } from './headscale.ts';
+import { cachedPolicy } from './hs-cache.ts';
 import { parsePolicy, stringifyPolicy, type AclPolicy } from '../acl/model.ts';
 
 export interface AclVersionRow {
@@ -98,7 +99,9 @@ export async function readCurrentPolicy(): Promise<{
   parsed: AclPolicy | null;
   parseError: string | null;
 }> {
-  const res = await hs().getPolicy();
+  // 走共享读缓存（2s 单飞合并）。策略是「读极多、写极少」的数据，
+  // 拓扑/版本页/漂移检测每次都要读一遍，没必要各自打上游。
+  const res = await cachedPolicy();
   const content = res.policy ?? '';
   const parsed = content.trim() === '' ? null : parsePolicy(content);
   return {

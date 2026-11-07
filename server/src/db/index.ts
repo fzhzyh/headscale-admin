@@ -52,6 +52,7 @@ export function db(): DatabaseSync {
 }
 
 export function closeDb(): void {
+  _stmts.clear();
   _db?.close();
   _db = null;
 }
@@ -61,29 +62,52 @@ export function exec(sql: string): void {
   db().exec(sql);
 }
 
+/**
+ * 预编译语句缓存。
+ *
+ * 为什么必须有：`prepare()` 每次都要做 SQL 解析 + 编译 + 生成执行计划，
+ * 而面板的读路径极热——每个请求至少 2 次（会话 + 权限），
+ * 采样器每 15s 一轮。实测在鉴权钩子里每请求都编译一次是纯浪费：
+ * 同一条 SQL 编译一次就够，语句对象本身无状态（参数每次传入）。
+ *
+ * 上限用简单的 FIFO 淘汰：`audit` 查询会拼出不同的 WHERE 组合，
+ * 没有上限时 SQL 字符串会成为事实上的内存泄漏点。
+ */
+const STMT_CACHE_MAX = 256;
+const _stmts = new Map<string, StatementSync>();
+
+function prep(sql: string): StatementSync {
+  const hit = _stmts.get(sql);
+  if (hit) return hit;
+  const stmt = db().prepare(sql);
+  if (_stmts.size >= STMT_CACHE_MAX) {
+    // Map 的迭代顺序即插入顺序，删最老的一条
+    const oldest = _stmts.keys().next();
+    if (!oldest.done) _stmts.delete(oldest.value);
+  }
+  _stmts.set(sql, stmt);
+  return stmt;
+}
+
 /** 查询多行 */
 export function all<T = Row>(sql: string, ...params: unknown[]): T[] {
-  const stmt: StatementSync = db().prepare(sql);
-  return stmt.all(...normalizeAll(params)) as T[];
+  return prep(sql).all(...normalizeAll(params)) as T[];
 }
 
 /** 查询单行 */
 export function get<T = Row>(sql: string, ...params: unknown[]): T | undefined {
-  const stmt: StatementSync = db().prepare(sql);
-  return stmt.get(...normalizeAll(params)) as T | undefined;
+  return prep(sql).get(...normalizeAll(params)) as T | undefined;
 }
 
 /** 写入，返回自增主键 */
 export function run(sql: string, ...params: unknown[]): number {
-  const stmt: StatementSync = db().prepare(sql);
-  const res = stmt.run(...normalizeAll(params));
+  const res = prep(sql).run(...normalizeAll(params));
   return Number(res.lastInsertRowid ?? 0);
 }
 
 /** 写入，返回受影响行数 */
 export function changes(sql: string, ...params: unknown[]): number {
-  const stmt: StatementSync = db().prepare(sql);
-  const res = stmt.run(...normalizeAll(params));
+  const res = prep(sql).run(...normalizeAll(params));
   return Number(res.changes ?? 0);
 }
 

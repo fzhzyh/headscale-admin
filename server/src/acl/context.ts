@@ -16,9 +16,10 @@
  *   由求值引擎按 tags 身份处理。
  */
 
-import { hs } from '../services/headscale.ts';
+import { cachedNodes, cachedPolicy, cachedUsers } from '../services/hs-cache.ts';
 import { interpretPolicy, type AclPolicy, type PolicyInterpretation } from './model.ts';
 import type { EvalInput, EvalNode } from './evaluator.ts';
+import type { HsNode } from '../headscale/client.ts';
 import { readCurrentPolicy } from '../services/acl-versions.ts';
 
 export interface AclEvalContext extends EvalInput {
@@ -28,7 +29,7 @@ export interface AclEvalContext extends EvalInput {
   /** 策略来源说明，用于告知用户看的是哪一份策略 */
   source: string;
   /** 原始节点列表（前端展示需要 online / expiry 等求值不需要的字段） */
-  rawNodes: Awaited<ReturnType<ReturnType<typeof hs>['listNodes']>>;
+  rawNodes: HsNode[];
 }
 
 /** 构造求值上下文；policy 可显式传入（用于草稿预览） */
@@ -43,7 +44,9 @@ export async function loadAclEvalContext(policy?: AclPolicy | null): Promise<Acl
     effective = cur.parsed;
   }
 
-  const [nodes, users] = await Promise.all([hs().listNodes(), hs().listUsers()]);
+  // 走共享读缓存：同一次请求里的节点/用户与采样器、其它页面共享同一份上游数据，
+  // 且并发查询会合并成一次真实请求（单飞），不再每个调用方各拉一遍。
+  const [nodes, users] = await Promise.all([cachedNodes(), cachedUsers()]);
 
   const evalNodes: EvalNode[] = nodes.map((n) => {
     const approved = n.approvedRoutes ?? [];

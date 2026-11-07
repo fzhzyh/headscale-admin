@@ -13,7 +13,18 @@
  */
 
 import { parseAlias, splitDestAndPort, parsePortRange, parseProtocol, portMatches } from './alias.ts';
-import { interpretPolicy, type AclPolicy, type PolicyMode } from './model.ts';
+import { interpretPolicy, type AclPolicy, type PolicyInterpretation, type PolicyMode } from './model.ts';
+
+/**
+ * 惰性 trace 写入器。
+ *
+ * 只把 `trace.push` 换成空操作是不够的：模板字符串在**调用前**就已经拼好并分配了，
+ * 静默 trace 只是没把结果存进数组而已。批量求值（拓扑要对上万对跑）时，
+ * 这里省下的是每对每条规则的中文说明 + `JSON.stringify(rule)`。
+ * 传入 thunk，只有真需要 trace 时才求值字符串。
+ */
+type TraceWriter = (make: () => string) => void;
+const NO_TRACE: TraceWriter = () => {};
 
 /** 参与求值的节点视图（来自 /api/v1/node 的归一化结果） */
 export interface EvalNode {
@@ -36,6 +47,51 @@ export interface EvalInput {
   nodes: EvalNode[];
   /** 已知的 Headscale 用户列表，用于 group: 与 user@ 解析 */
   users: { id: number; name: string; email?: string | null }[];
+}
+
+/**
+ * 单次求值会话的缓存。
+ *
+ * ## 为什么需要
+ * 访问检查本身是单对求值，但**拓扑页要做 O(N²) 对**，每对都会把
+ * 「某用户/某标签/某组名下有哪些节点」重新 filter 一遍。
+ * N=50 时这是 2450 对 × (规则数 × 别名数) 次全表扫描 + 集合重建。
+ *
+ * 这些结果在**同一次请求内**是完全不变的（策略、节点、用户都固定），
+ * 所以按 (别名, 视角用户, src/dst) 记住即可，跨对复用。
+ *
+ * ## 边界
+ * - 只在单次请求内有效，由调用方创建；不跨请求共享，
+ *   这样策略一变就不可能有脏数据（无失效逻辑 = 无失效 bug）
+ * - 缓存里的 ResolvedSet 一律视为**只读**，调用方不得修改
+ * - 容量随「节点数 × 规则别名数」增长，天然有界
+ */
+export interface EvalCache {
+  /** 别名解析结果：`S|D` + viewerUser + token → 集合 */
+  alias: Map<string, ResolvedSet>;
+  /** 主体（源/目的节点）构造结果，避免每对重复解析路由 */
+  subjects: Map<string, Subject | { error: string }>;
+  /** 节点集合查询：用户名/标签/是否打标签 → 节点数组 */
+  nodeSets: Map<string, EvalNode[]>;
+  /** 策略解释：同一次请求里 policy 不变，interpretPolicy 只需跑一次 */
+  interpretation?: PolicyInterpretation;
+}
+
+export function createEvalCache(): EvalCache {
+  return { alias: new Map(), subjects: new Map(), nodeSets: new Map() };
+}
+
+/**
+ * 取「满足条件的节点」并缓存。
+ * key 由调用方给（如 `user:labadmin` / `tag:tag:db`），保证不同维度不会撞键。
+ */
+function nodesMatching(nodes: EvalNode[], cache: EvalCache | undefined, key: string, pred: (n: EvalNode) => boolean): EvalNode[] {
+  if (!cache) return nodes.filter(pred);
+  const hit = cache.nodeSets.get(key);
+  if (hit) return hit;
+  const val = nodes.filter(pred);
+  cache.nodeSets.set(key, val);
+  return val;
 }
 
 export interface AccessCheckRequest {
@@ -76,6 +132,12 @@ export interface AccessCheckResult {
 // ============================================================
 
 function ipToBigInt(ip: string): bigint | null {
+  const cached = _ipMemo.get(ip);
+  if (cached !== undefined) return cached;
+  return memoSet(_ipMemo, ip, ipToBigIntUncached(ip));
+}
+
+function ipToBigIntUncached(ip: string): bigint | null {
   if (ip.includes(':')) {
     // 简化 IPv6 处理：展开为 128 位
     const expanded = expandV6(ip);
@@ -113,7 +175,36 @@ interface Cidr {
   isV6: boolean;
 }
 
+/**
+ * IP / CIDR 解析记忆化。
+ *
+ * 求值是纯函数且**输入高度重复**：同一条规则里的同一个 CIDR，
+ * 会在每一对节点求值时被重新解析一次；拓扑的 O(N²) 循环里
+ * 同一个 CIDR 可能被解析上万次，每次都做 BigInt 位移与正则。
+ *
+ * 加缓存后这块成本从「每对每规则」降到「进程内一次」。
+ * 失败结果（null）也缓存——非法 CIDR 同样会被反复命中，
+ * 缓存它能避免重复走失败分支。
+ * 容量上限防止恶意/畸形策略把内存撑爆。
+ */
+const PARSE_CACHE_MAX = 4096;
+const _cidrMemo = new Map<string, Cidr | null>();
+const _ipMemo = new Map<string, bigint | null>();
+
+/** 有界记忆化：满了直接清空（缓存只是加速，清空不影响正确性） */
+function memoSet<T>(m: Map<string, T>, k: string, v: T): T {
+  if (m.size >= PARSE_CACHE_MAX) m.clear();
+  m.set(k, v);
+  return v;
+}
+
 function parseCidr(s: string): Cidr | null {
+  const cached = _cidrMemo.get(s);
+  if (cached !== undefined) return cached;
+  return memoSet(_cidrMemo, s, parseCidrUncached(s));
+}
+
+function parseCidrUncached(s: string): Cidr | null {
   const m = /^(.+?)\/(\d{1,3})$/.exec(s);
   const addr = m ? m[1]! : s;
   const isV6 = addr.includes(':');
@@ -125,25 +216,38 @@ function parseCidr(s: string): Cidr | null {
   return { base: n, bits, isV6 };
 }
 
+/**
+ * 掩码缓存：按 (isV6, 前缀长度) 只构造一次。
+ *
+ * 掩码是 BigInt 位移的结果，每次比较都重算两个大整数移位在 O(N²×规则)
+ * 的拓扑求值里是可观的纯开销。掩码只依赖位宽，与具体地址无关 —— 天然可缓存。
+ */
+const _maskMemo = new Map<string, bigint>();
+function netMask(isV6: boolean, bits: number): bigint {
+  const key = isV6 ? `6:${bits}` : `4:${bits}`;
+  const hit = _maskMemo.get(key);
+  if (hit !== undefined) return hit;
+  const total = isV6 ? 128 : 32;
+  const shift = BigInt(total - bits);
+  const mask = shift === 0n ? ~0n : ((1n << BigInt(total)) - 1n) ^ ((1n << shift) - 1n);
+  if (_maskMemo.size > 512) _maskMemo.clear();
+  _maskMemo.set(key, mask);
+  return mask;
+}
+
 /** 某 IP 是否落在 CIDR 内 */
 function ipInCidr(ip: string, cidr: Cidr): boolean {
   const n = ipToBigInt(ip);
   if (n === null) return false;
-  const isV6 = ip.includes(':');
-  if (isV6 !== cidr.isV6) return false;
-  const total = cidr.isV6 ? 128 : 32;
-  const shift = BigInt(total - cidr.bits);
-  const mask = shift === 0n ? ~0n : ((1n << BigInt(total)) - 1n) ^ ((1n << shift) - 1n);
+  if (ip.includes(':') !== cidr.isV6) return false;
+  const mask = netMask(cidr.isV6, cidr.bits);
   return (n & mask) === (cidr.base & mask);
 }
 
-/** 两个 CIDR 是否有交集 */
+/** 两个 CIDR 是否有交集（取较短前缀的掩码对齐即可） */
 function cidrOverlaps(a: Cidr, b: Cidr): boolean {
   if (a.isV6 !== b.isV6) return false;
-  const total = a.isV6 ? 128 : 32;
-  const bits = Math.min(a.bits, b.bits);
-  const shift = BigInt(total - bits);
-  const mask = shift === 0n ? ~0n : ((1n << BigInt(total)) - 1n) ^ ((1n << shift) - 1n);
+  const mask = netMask(a.isV6, Math.min(a.bits, b.bits));
   return (a.base & mask) === (b.base & mask);
 }
 
@@ -212,6 +316,28 @@ function resolveAlias(
   users: { id: number; name: string; email?: string | null }[],
   viewerUser: string | null,
   asSource: boolean,
+  cache?: EvalCache,
+): ResolvedSet {
+  // 记忆化：同一请求内同一个别名的解析结果完全不变
+  if (cache) {
+    const key = `${asSource ? 'S' : 'D'}|${viewerUser ?? ''}|${token}`;
+    const hit = cache.alias.get(key);
+    if (hit) return hit;
+    const fresh = resolveAliasUncached(token, policy, nodes, users, viewerUser, asSource, cache);
+    cache.alias.set(key, fresh);
+    return fresh;
+  }
+  return resolveAliasUncached(token, policy, nodes, users, viewerUser, asSource, undefined);
+}
+
+function resolveAliasUncached(
+  token: string,
+  policy: AclPolicy | null,
+  nodes: EvalNode[],
+  users: { id: number; name: string; email?: string | null }[],
+  viewerUser: string | null,
+  asSource: boolean,
+  cache?: EvalCache,
 ): ResolvedSet {
   const out = emptySet();
   const parsed = parseAlias(token);
@@ -258,7 +384,7 @@ function resolveAlias(
         return out;
       }
       // hosts 指向 tag / user / group 等身份别名：递归解析
-      const sub = resolveAlias(hostValue, policy, nodes, users, viewerUser, asSource);
+      const sub = resolveAlias(hostValue, policy, nodes, users, viewerUser, asSource, cache);
       out.ips = sub.ips;
       out.cidrs = sub.cidrs;
       out.everything = sub.everything;
@@ -277,7 +403,7 @@ function resolveAlias(
         out.notes.push(`用户 "${name}" 尚未注册，解析为空集合（headscale 同样容忍）`);
         return out;
       }
-      const owned = nodes.filter((n) => n.userName === user.name);
+      const owned = nodesMatching(nodes, cache, `user:${user.name}`, (n) => n.userName === user.name);
       for (const n of owned) {
         for (const ip of n.ips) out.ips.add(ip);
         for (const r of n.approvedRoutes) {
@@ -293,7 +419,7 @@ function resolveAlias(
       //   grpcv1.go:557 "Tags-as-identity: tagged nodes show as TaggedDevices user"）。
       // 因此 user@ 永远**不会**命中已打标签的设备——这是 headscale 的真实行为，
       // 不是本引擎的限制。用户最常见的困惑是「给设备打了标签后按用户的规则就失效了」。
-      const taggedCount = nodes.filter((n) => n.tags.length > 0).length;
+      const taggedCount = nodesMatching(nodes, cache, '__tagged__', (n) => n.tags.length > 0).length;
       if (taggedCount > 0) {
         out.notes.push(
           `注意：当前有 ${taggedCount} 台设备已打标签，它们已脱离用户归属，` +
@@ -311,7 +437,7 @@ function resolveAlias(
         return out;
       }
       for (const m of members) {
-        const sub = resolveAlias(m, policy, nodes, users, viewerUser, asSource);
+        const sub = resolveAlias(m, policy, nodes, users, viewerUser, asSource, cache);
         for (const ip of sub.ips) out.ips.add(ip);
         out.cidrs.push(...sub.cidrs);
         if (sub.everything) out.everything = true;
@@ -323,7 +449,7 @@ function resolveAlias(
     }
 
     case 'tag': {
-      const tagged = nodes.filter((n) => n.tags.includes(parsed.value));
+      const tagged = nodesMatching(nodes, cache, `tag:${parsed.value}`, (n) => n.tags.includes(parsed.value));
       for (const n of tagged) {
         for (const ip of n.ips) out.ips.add(ip);
         for (const r of n.approvedRoutes) {
@@ -352,7 +478,7 @@ function resolveAlias(
           return out;
         }
         case 'autogroup:member': {
-          const members = nodes.filter((n) => n.tags.length === 0);
+          const members = nodesMatching(nodes, cache, '__untagged__', (n) => n.tags.length === 0);
           for (const n of members) {
             for (const ip of n.ips) out.ips.add(ip);
             for (const r of n.approvedRoutes) {
@@ -365,7 +491,7 @@ function resolveAlias(
           return out;
         }
         case 'autogroup:tagged': {
-          const tagged = nodes.filter((n) => n.tags.length > 0);
+          const tagged = nodesMatching(nodes, cache, '__tagged__', (n) => n.tags.length > 0);
           for (const n of tagged) {
             for (const ip of n.ips) out.ips.add(ip);
             for (const r of n.approvedRoutes) {
@@ -401,7 +527,12 @@ function resolveAlias(
 }
 
 /** 展开 autogroup:self —— 限定为查看者用户名下的设备 */
-function applySelfScope(set: ResolvedSet, nodes: EvalNode[], viewerUser: string | null): ResolvedSet {
+function applySelfScope(
+  set: ResolvedSet,
+  nodes: EvalNode[],
+  viewerUser: string | null,
+  cache?: EvalCache,
+): ResolvedSet {
   if (!set.selfScoped) return set;
   const out = emptySet();
   out.notes = [...set.notes];
@@ -410,7 +541,7 @@ function applySelfScope(set: ResolvedSet, nodes: EvalNode[], viewerUser: string 
     out.notes.push('缺少查看者身份，autogroup:self 无法解析');
     return out;
   }
-  const owned = nodes.filter((n) => n.userName === viewerUser);
+  const owned = nodesMatching(nodes, cache, `self:${viewerUser}`, (n) => n.userName === viewerUser);
   for (const n of owned) {
     for (const ip of n.ips) out.ips.add(ip);
     for (const r of n.approvedRoutes) {
@@ -442,8 +573,11 @@ function buildSubject(
   nodes: EvalNode[],
   users: { id: number; name: string; email?: string | null }[],
   isSource: boolean,
-  trace: string[],
+  tpush: TraceWriter,
+  cache?: EvalCache,
 ): Subject | { error: string } {
+  // 注意：主体构造会写 trace，所以不缓存「主体」本身（否则 trace 会丢），
+  // 只缓存它用到的节点集合查询（见 nodesMatching）——那才是 O(N²) 里的大头。
   if ('nodeId' in side) {
     const n = nodes.find((x) => x.id === side.nodeId);
     if (!n) return { error: `节点 #${side.nodeId} 不存在` };
@@ -453,8 +587,9 @@ function buildSubject(
       const c = parseCidr(r);
       if (c) cidrs.push(c);
     }
-    trace.push(
-      `${isSource ? '源' : '目的'}节点「${n.displayName}」：IP ${n.ips.join(', ') || '无'}` +
+    tpush(
+      () =>
+        `${isSource ? '源' : '目的'}节点「${n.displayName}」：IP ${n.ips.join(', ') || '无'}` +
         (n.approvedRoutes.length ? `；已批准子网路由 ${n.approvedRoutes.join(', ')}` : '') +
         (n.isExitNode ? '；是出口节点' : '') +
         (n.tags.length
@@ -467,19 +602,19 @@ function buildSubject(
   if ('cidr' in side) {
     const c = parseCidr(side.cidr);
     if (!c) return { error: `CIDR 格式不正确：${side.cidr}` };
-    trace.push(`${isSource ? '源' : '目的'}地址段 ${side.cidr}`);
+    tpush(() => `${isSource ? '源' : '目的'}地址段 ${side.cidr}`);
     return { ips: [], cidrs: [c], everything: false, isExitNode: false, label: side.cidr };
   }
 
   if ('internet' in side) {
-    trace.push('目的为「互联网」；只有对端是出口节点时才可能命中');
+    tpush(() => '目的为「互联网」；只有对端是出口节点时才可能命中');
     return { ips: [], cidrs: [], everything: false, isExitNode: true, label: '互联网' };
   }
 
   if ('user' in side) {
     const user = users.find((u) => u.name === side.user);
     if (!user) return { error: `用户「${side.user}」不存在` };
-    const owned = nodes.filter((n) => n.userName === user.name);
+    const owned = nodesMatching(nodes, cache, `user:${user.name}`, (n) => n.userName === user.name);
     const ips = owned.flatMap((n) => n.ips);
     const cidrs: Cidr[] = [];
     for (const n of owned) {
@@ -489,7 +624,7 @@ function buildSubject(
         if (c) cidrs.push(c);
       }
     }
-    trace.push(`用户「${side.user}」名下 ${owned.length} 台设备：${ips.join(', ') || '无 IP'}`);
+    tpush(() => `用户「${side.user}」名下 ${owned.length} 台设备：${ips.join(', ') || '无 IP'}`);
     return {
       ips,
       cidrs,
@@ -500,7 +635,7 @@ function buildSubject(
   }
 
   if ('tag' in side) {
-    const tagged = nodes.filter((n) => n.tags.includes(side.tag));
+    const tagged = nodesMatching(nodes, cache, `tag:${side.tag}`, (n) => n.tags.includes(side.tag));
     const ips = tagged.flatMap((n) => n.ips);
     const cidrs: Cidr[] = [];
     for (const n of tagged) {
@@ -510,7 +645,7 @@ function buildSubject(
         if (c) cidrs.push(c);
       }
     }
-    trace.push(`标签「${side.tag}」命中 ${tagged.length} 台设备`);
+    tpush(() => `标签「${side.tag}」命中 ${tagged.length} 台设备`);
     return {
       ips,
       cidrs,
@@ -552,28 +687,69 @@ function setsOverlap(src: ResolvedSet, dst: ResolvedSet, dstIsExit = false): boo
 /**
  * 判定「源能否访问目的」。
  */
-export function checkAccess(input: EvalInput, req: AccessCheckRequest): AccessCheckResult {
+export interface CheckOptions {
+  /** 复用缓存（O(N²) 批量求值时必传，否则每对都重算） */
+  cache?: EvalCache;
+  /**
+   * 是否构建 trace（默认 true）。
+   *
+   * 拓扑页要对 N×(N-1) 对求值，但**根本不展示 trace**。
+   * 每对都拼十几条中文说明字符串，在 N=50 时是 2450 次 × 十几条 = 数万次字符串分配，
+   * 纯属给 GC 加压。批量场景传 false 即可跳过。
+   */
+  trace?: boolean;
+}
+
+/**
+ * 判定「源能否访问目的」。
+ *
+ * 单对调用不必传 options；批量（拓扑/矩阵）请传同一个 cache 且 trace=false。
+ */
+export function checkAccess(input: EvalInput, req: AccessCheckRequest, opts: CheckOptions = {}): AccessCheckResult {
+  const wantTrace = opts.trace !== false;
   const trace: string[] = [];
-  const interp = interpretPolicy(input.policy);
-  trace.push(`策略模式：${interp.mode} —— ${interp.explanation}`);
+  const tpush: TraceWriter = wantTrace ? (make) => { trace.push(make()); } : NO_TRACE;
+  const cache = opts.cache;
+
+  // 策略解释在一次批量会话里恒定，没必要每对重跑一遍 interpretPolicy。
+  let interp = cache?.interpretation;
+  if (!interp) {
+    interp = interpretPolicy(input.policy);
+    if (cache) cache.interpretation = interp;
+  }
+  tpush(() => `策略模式：${interp!.mode} —— ${interp!.explanation}`);
 
   const base: Omit<AccessCheckResult, 'allowed' | 'reason' | 'explanation' | 'matched'> = {
     mode: interp.mode,
     trace,
   };
 
-  const srcSubj = buildSubject(req.from, input.nodes, input.users, true, trace);
+  // 主体构造的缓存键：同一节点在批量求值里会被当作 src 和 dst 各 N-1 次。
+  // 仅在静默 trace 时缓存（因为主体构造会写 trace，缓存会丢诊断信息）。
+  const subjectOf = (side: AccessCheckRequest['from'] | AccessCheckRequest['to'], isSource: boolean) => {
+    if (!cache || wantTrace) {
+      return buildSubject(side, input.nodes, input.users, isSource, tpush, cache);
+    }
+    const key = isSource ? `S|${JSON.stringify(side)}` : `D|${JSON.stringify(side)}`;
+    const hit = cache.subjects.get(key);
+    if (hit) return hit;
+    const built = buildSubject(side, input.nodes, input.users, isSource, tpush, cache);
+    cache.subjects.set(key, built);
+    return built;
+  };
+
+  const srcSubj = subjectOf(req.from, true);
   if ('error' in srcSubj) {
     return { ...base, allowed: false, reason: 'no-matching-rule', matched: [], explanation: srcSubj.error, error: srcSubj.error };
   }
-  const dstSubj = buildSubject(req.to, input.nodes, input.users, false, trace);
+  const dstSubj = subjectOf(req.to, false);
   if ('error' in dstSubj) {
     return { ...base, allowed: false, reason: 'no-matching-rule', matched: [], explanation: dstSubj.error, error: dstSubj.error };
   }
 
   // ---------- 全通模式：不需要任何规则 ----------
   if (interp.mode === 'allow-all') {
-    trace.push('策略处于「全通」模式，无需匹配任何规则即放行');
+    tpush(() => '策略处于「全通」模式，无需匹配任何规则即放行');
     return {
       ...base,
       allowed: true,
@@ -585,7 +761,7 @@ export function checkAccess(input: EvalInput, req: AccessCheckRequest): AccessCh
 
   // ---------- 全禁模式 ----------
   if (interp.mode === 'deny-all') {
-    trace.push('策略处于「全禁」模式（规则列表为空），任何流量都不放行');
+    tpush(() => '策略处于「全禁」模式（规则列表为空），任何流量都不放行');
     return {
       ...base,
       allowed: false,
@@ -605,54 +781,67 @@ export function checkAccess(input: EvalInput, req: AccessCheckRequest): AccessCh
   const proto = parseProtocol(req.proto);
   if (proto === null) {
     const msg = `协议不合法："${req.proto}"（headscale 不支持通配符 *，请写协议名或 IANA 编号）`;
-    trace.push(msg);
+    tpush(() => msg);
     return { ...base, allowed: false, reason: 'no-matching-rule', matched: [], explanation: msg, error: msg };
   }
-  trace.push(`协议：${proto.name}（${proto.number}）${port !== undefined ? `，端口 ${port}` : '，端口未限定'}`);
+  tpush(() => `协议：${proto.name}（${proto.number}）${port !== undefined ? `，端口 ${port}` : '，端口未限定'}`);
+
+  // 主体地址集合在一次求值里恒定：旧实现在**每条规则、每个别名**上都重建
+  // 一次 `new Set(ips)` 与整个 ResolvedSet 对象，是批量求值的主要分配源之一。
+  const srcSet: ResolvedSet = {
+    ips: new Set(srcSubj.ips),
+    cidrs: srcSubj.cidrs,
+    everything: srcSubj.everything,
+    internet: false,
+    selfScoped: false,
+    notes: [],
+    unresolved: [],
+  };
+  const dstSet: ResolvedSet = {
+    ips: new Set(dstSubj.ips),
+    cidrs: dstSubj.cidrs,
+    everything: dstSubj.everything,
+    internet: false,
+    selfScoped: false,
+    notes: [],
+    unresolved: [],
+  };
 
   const matched: MatchedRule[] = [];
 
   (policy.acls ?? []).forEach((rule, idx) => {
-    const desc = `acls[${idx}] ${rule.action} proto=${rule.proto} src=${JSON.stringify(rule.src)} dst=${JSON.stringify(rule.dst)}`;
+    // desc 含两次 JSON.stringify，静默 trace 时绝不能构造
+    const desc = () => `acls[${idx}] ${rule.action} proto=${rule.proto} src=${JSON.stringify(rule.src)} dst=${JSON.stringify(rule.dst)}`;
 
     // 协议匹配
     const ruleProto = parseProtocol(rule.proto);
     if (ruleProto === null) {
-      trace.push(`${desc} —— 规则协议非法，跳过`);
+      tpush(() => `${desc()} —— 规则协议非法，跳过`);
       return;
     }
     if (ruleProto.number !== 0 && ruleProto.number !== proto.number) {
-      trace.push(`${desc} —— 协议不匹配（规则 ${ruleProto.name} vs 请求 ${proto.name}）`);
+      tpush(() => `${desc()} —— 协议不匹配（规则 ${ruleProto.name} vs 请求 ${proto.name}）`);
       return;
     }
 
     // src 匹配
-    let srcHit: ResolvedSet | null = null;
+    let srcHit = false;
     let srcToken = '';
     for (const t of rule.src) {
-      const set = applySelfScope(resolveAlias(t, policy, input.nodes, input.users, viewerUser, true), input.nodes, viewerUser);
-      if (
-        setsOverlap(
-          set,
-          {
-            ips: new Set(srcSubj.ips),
-            cidrs: srcSubj.cidrs,
-            everything: srcSubj.everything,
-            internet: false,
-            selfScoped: false,
-            notes: [],
-            unresolved: [],
-          },
-          dstSubj.isExitNode,
-        )
-      ) {
-        srcHit = set;
+      const set = applySelfScope(
+        resolveAlias(t, policy, input.nodes, input.users, viewerUser, true, cache),
+        input.nodes,
+        viewerUser,
+        cache,
+      );
+      if (setsOverlap(set, srcSet, dstSubj.isExitNode)) {
+        srcHit = true;
         srcToken = t;
         break;
       }
     }
     if (!srcHit) {
-      trace.push(`${desc} —— 源不匹配`);
+      tpush(() => `${desc()} —— 源不匹配`);
       return;
     }
 
@@ -662,31 +851,23 @@ export function checkAccess(input: EvalInput, req: AccessCheckRequest): AccessCh
     for (const d of rule.dst) {
       const split = splitDestAndPort(d);
       if (!split) {
-        trace.push(`${desc} —— dst 条目 "${d}" 缺少端口或格式非法`);
+        tpush(() => `${desc()} —— dst 条目 "${d}" 缺少端口或格式非法`);
         continue;
       }
       const ranges = parsePortRange(split.port, rule.proto);
       if (!ranges) {
-        trace.push(`${desc} —— dst 端口 "${split.port}" 非法`);
+        tpush(() => `${desc()} —— dst 端口 "${split.port}" 非法`);
         continue;
       }
       // 端口匹配
       if (port !== undefined && !portMatches(ranges, port)) continue;
 
       const set = applySelfScope(
-        resolveAlias(split.dest, policy, input.nodes, input.users, viewerUser, false),
+        resolveAlias(split.dest, policy, input.nodes, input.users, viewerUser, false, cache),
         input.nodes,
         viewerUser,
+        cache,
       );
-      const dstSet: ResolvedSet = {
-        ips: new Set(dstSubj.ips),
-        cidrs: dstSubj.cidrs,
-        everything: dstSubj.everything,
-        internet: false,
-        selfScoped: false,
-        notes: [],
-        unresolved: [],
-      };
       if (setsOverlap(set, dstSet, dstSubj.isExitNode)) {
         dstOk = true;
         dstToken = d;
@@ -694,11 +875,11 @@ export function checkAccess(input: EvalInput, req: AccessCheckRequest): AccessCh
       }
     }
     if (!dstOk) {
-      trace.push(`${desc} —— 目的或端口不匹配`);
+      tpush(() => `${desc()} —— 目的或端口不匹配`);
       return;
     }
 
-    trace.push(`${desc} —— ✓ 命中`);
+    tpush(() => `${desc()} —— ✓ 命中`);
     matched.push({
       index: idx,
       rule: `${rule.action} ${rule.proto} ${rule.src.join(', ')} → ${rule.dst.join(', ')}`,

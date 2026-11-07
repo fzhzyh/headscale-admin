@@ -2,16 +2,16 @@
 /**
  * P4 网络拓扑前端验证（无头浏览器 + 真实 ACL 语义）
  *
- * 这个脚本不只"看页面渲染出来了"，而是**验证拓扑边与 ACL 语义一致**：
+ * 拓扑是**两层树**：第一层唯一根 = WireGuard 虚拟专用网络（VPC），
+ * 第二层是各自接入 VPC 的设备；设备之间不画线。所以画布上边的数量恒等于
+ * 可见设备数，而不是 N×(N-1)。逐对 ACL 求值仍然要做，但它决定的是
+ * 每台设备的三态（绿 ok / 橙 partial / 灰 offline），不是连线。
  *
- *   1. 基线策略（`*` 全通一条规则）→ 4 台设备应有 4×3 = 12 条有向边
- *   2. 换成 `labadmin@ → devops@:*` → 应精确变成 4 条边，
- *      且方向只能是 labadmin 的设备指向 devops 的设备（无反边、无同用户边）
- *   3. 还原基线，确认回到 12 条
- *
- * 为什么值得这么测：拓扑最容易出的错不是"画不出来"，而是"画得不对"——
- * 少画一条边会被误读成「不允许访问」，多画一条会被误读成「放行了」。
- * 只断言"有连线"是测不出方向性和选择性的。
+ * 验证重点：
+ *   1. 唯一 VPC 根节点 + 所有连线都由 vpc 出发，策略怎么变边数都不变
+ *   2. 全通 → 在线设备全绿；限制性策略 → 在线设备转橙且带 unreachableIds
+ *   3. 全禁 → 在线设备全橙；离线设备恒为灰，隐藏离线后节点与边同步减少
+ *   4. 后端 edges 明细仍可用于交叉核对方向性（树状图不渲染它）
  *
  * 用法：node lab/verify_topology_ui.mjs
  */
@@ -145,9 +145,10 @@ console.log('='.repeat(88));
 await setPolicy(BASELINE_POLICY, '拓扑 UI 测试：基线');
 const baseTopo = await readTopology();
 const nodeCount = baseTopo.stats.nodeCount;
-const expectedAllPairs = nodeCount * (nodeCount - 1);
-check('基线策略下边数 = N×(N-1)（全通单规则）', baseTopo.stats.allowedEdges === expectedAllPairs, `${baseTopo.stats.allowedEdges} / 期望 ${expectedAllPairs}`);
-check('逐对求值对数与边数一致（无规则被漏算）', baseTopo.stats.pairEvaluated === expectedAllPairs, `${baseTopo.stats.pairEvaluated} 对`);
+// 互通判定只针对在线设备；离线设备不参与逐对求值
+const expectedAllPairs = baseTopo.stats.onlineCount * Math.max(0, baseTopo.stats.onlineCount - 1);
+check('基线策略下放行边数 = 在线设备两两有向对数', baseTopo.stats.allowedEdges === expectedAllPairs, `${baseTopo.stats.allowedEdges} / 期望 ${expectedAllPairs}`);
+check('逐对求值对数与放行边数一致（无规则被漏算）', baseTopo.stats.pairEvaluated === expectedAllPairs, `${baseTopo.stats.pairEvaluated} 对`);
 check('未被截断', baseTopo.stats.truncated === false);
 
 // ---------------------------------------------------------------- 登录 + 导航
@@ -192,14 +193,21 @@ for (const name of baseTopo.nodes.slice(0, 3).map((n) => n.displayName)) {
 }
 check('显示设备 IP', /\b100\.64\.\d+\.\d+\b/.test(nodeText), (nodeText.match(/100\.64\.\d+\.\d+/) ?? [''])[0]);
 
-// ---------------------------------------------------------------- 边与语义
+// ---------------------------------------------------------------- 树状结构
 console.log('\n' + '='.repeat(88));
-console.log('3. 边与 ACL 语义一致（核心断言）');
+console.log('3. 树状结构：唯一 VPC 根 + 根→设备连线');
 console.log('='.repeat(88));
 
-const edgeCount = await page.locator('.react-flow__edge').count();
-check('基线：边数与后端一致（全通 12 条）', edgeCount === baseTopo.stats.allowedEdges, `DOM ${edgeCount} / 后端 ${baseTopo.stats.allowedEdges}`);
-check('规则模式横幅显示放行关系数', (await page.locator('text=规则模式').count()) > 0);
+check('第一层：唯一 VPC 根节点', (await page.locator('[data-testid="topo-vpc"]').count()) === 1);
+const edgeIds = await page.evaluate(() =>
+  Array.from(document.querySelectorAll('.react-flow__edge')).map((e) => e.getAttribute('data-id') || e.id),
+);
+check('边数 = 设备数（每台设备一条根连线）', edgeIds.length === nodeCount, `DOM ${edgeIds.length} / 设备 ${nodeCount}`);
+check('所有连线都由 vpc 出发（设备之间不连线）', edgeIds.every((id) => id.startsWith('vpc-')), edgeIds.join(', '));
+check('规则模式横幅显示逐对求值数', (await page.locator('text=规则模式').count()) > 0);
+check('基线：全部设备为互通正常（绿）',
+  baseTopo.nodes.filter((n) => n.online).every((n) => n.reachStatus === 'ok'),
+  baseTopo.nodes.map((n) => n.reachStatus).join(','));
 
 // —— 换成限制性策略，页面必须跟着变 ——
 console.log('    切换到限制性策略：labadmin@ → devops@:*');
@@ -211,7 +219,12 @@ const restTopo = await readTopology();
 check('后端边数变为 2×2=4', restTopo.stats.allowedEdges === 4, `${restTopo.stats.allowedEdges} 条`);
 
 const restEdges = await page.locator('.react-flow__edge').count();
-check('DOM 边数同步为 4（不是缓存旧图）', restEdges === 4, `DOM ${restEdges} 条`);
+check('树状边数恒为设备数（策略变化不改变连线）', restEdges === nodeCount, `DOM ${restEdges} / 设备 ${nodeCount}`);
+check('限制性策略下在线设备转为橙色 partial',
+  restTopo.nodes.filter((n) => n.online).every((n) => n.reachStatus === 'partial'),
+  restTopo.nodes.map((n) => n.reachStatus).join(','));
+check('橙色设备带 unreachableIds（供悬停高亮）',
+  restTopo.nodes.filter((n) => n.reachStatus === 'partial').every((n) => n.unreachableCount > 0 && n.unreachableIds.length > 0));
 
 // 方向性：所有边的 from 必须是 labadmin 设备，to 必须是 devops 设备
 const adminIds = new Set(restTopo.nodes.filter((n) => n.user === 'labadmin').map((n) => n.id));
@@ -228,7 +241,7 @@ check(
 check('边命中的规则可回指（ruleIndex 非空）', restTopo.edges.every((e) => e.ruleIndex !== null));
 
 const statsText = (await page.locator('.hsa-card', { hasText: '统计' }).first().innerText()) || '';
-check('统计面板「放行边数」同步为 4', /放行边数\s*4/.test(statsText), statsText.replace(/\n/g, ' / ').slice(0, 80));
+check('统计面板显示「存在不通」计数', /存在不通/.test(statsText), statsText.replace(/\n/g, ' / ').slice(0, 80));
 
 // ---------------------------------------------------------------- 全通/全禁横幅
 console.log('\n' + '='.repeat(88));
@@ -243,21 +256,26 @@ await setPolicy('{}', '拓扑 UI 测试：全通', true);
 await page.reload({ waitUntil: 'networkidle' });
 await page.waitForTimeout(2000);
 const allowText = (await page.locator('body').innerText()) || '';
-check('全通模式显示醒目横幅', allowText.includes('全通') && allowText.includes('不绘制逐对连线'));
+check('全通模式显示醒目横幅', allowText.includes('全通') && allowText.includes('全部在线设备显示为绿色'));
 const allowEdges = await page.locator('.react-flow__edge').count();
-check('全通模式不画 N² 条箭头', allowEdges === 0, `DOM ${allowEdges} 条`);
+check('全通模式仍是树（边数 = 设备数，不是 N² 箭头）', allowEdges === nodeCount, `DOM ${allowEdges} 条`);
+check('全通模式在线设备全绿',
+  (await page.locator('[data-testid^="topo-node-"][data-status="ok"]').count()) === baseTopo.stats.onlineCount,
+  `绿 ${await page.locator('[data-testid^="topo-node-"][data-status="ok"]').count()} / 在线 ${baseTopo.stats.onlineCount}`);
 
 // 全禁：{"acls":[]} → deny-all
 await setPolicy('{"acls":[]}', '拓扑 UI 测试：全禁', true);
 await page.reload({ waitUntil: 'networkidle' });
 await page.waitForTimeout(2000);
 const denyText = (await page.locator('body').innerText()) || '';
-check('全禁模式显示横幅并说明「没有连线就是结论」', denyText.includes('全禁'));
-check('全禁模式边数为 0', (await page.locator('.react-flow__edge').count()) === 0);
+check('全禁模式显示横幅并说明全部为橙色', denyText.includes('全禁') && denyText.includes('全部在线设备显示为橙色'));
+check('全禁模式仍是树（边数 = 设备数）', (await page.locator('.react-flow__edge').count()) === nodeCount);
+check('全禁模式在线设备全橙',
+  (await page.locator('[data-testid^="topo-node-"][data-status="partial"]').count()) === baseTopo.stats.onlineCount);
 
 // ---------------------------------------------------------------- 只看在线
 console.log('\n' + '='.repeat(88));
-console.log('5. 「只看在线」过滤');
+console.log('5. 「隐藏离线」过滤');
 console.log('='.repeat(88));
 
 await setPolicy(BASELINE_POLICY, '拓扑 UI 测试：还原基线');
@@ -269,9 +287,10 @@ const onlineCount = onlineTopo.nodes.filter((n) => n.online).length;
 await page.locator('.ant-switch').first().click();
 await page.waitForTimeout(2500);
 const onlineEdges = await page.locator('.react-flow__edge').count();
-const expectedOnlineEdges = onlineCount * Math.max(0, onlineCount - 1);
-check('只看在线：边数 = 在线设备数×(在线数-1)', onlineEdges === expectedOnlineEdges, `在线 ${onlineCount} 台 → ${onlineEdges} 条（期望 ${expectedOnlineEdges}）`);
-check('只看在线：节点仍全部展示（只是不画离线间的边）', (await page.locator('[data-testid^="topo-node-"]').count()) === nodeCount);
+check('隐藏离线：边数 = 在线设备数', onlineEdges === onlineCount, `在线 ${onlineCount} 台 → ${onlineEdges} 条`);
+check('隐藏离线：离线节点从画布移除', (await page.locator('[data-testid^="topo-node-"]').count()) === onlineCount);
+check('离线设备状态为灰色 offline',
+  onlineTopo.nodes.filter((n) => !n.online).every((n) => n.reachStatus === 'offline'));
 
 // ---------------------------------------------------------------- 语义说明
 console.log('\n' + '='.repeat(88));
@@ -279,7 +298,7 @@ console.log('6. 语义说明的诚实性');
 console.log('='.repeat(88));
 
 const finalText = (await page.locator('body').innerText()) || '';
-check('说明边代表控制面 ACL 放行关系', finalText.includes('控制面 ACL 放行关系'));
+check('说明颜色来自控制面 ACL 双向放行关系', finalText.includes('控制面 ACL'));
 check('明确否认「有数据流量经过」', finalText.includes('不代表有数据流量经过'));
 check('说明数据面流量不经 headscale', finalText.includes('WireGuard 直连'));
 check('标注策略来源', finalText.includes('策略来源'));

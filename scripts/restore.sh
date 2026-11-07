@@ -54,6 +54,8 @@ while [ $# -gt 0 ]; do
 done
 
 running() { docker ps --format '{{.Names}}' | grep -qx "$1"; }
+# 一体化 overlay 改了 container_name，按 compose 服务名判断更稳
+compose_running() { [ -n "$(docker compose ps --status running -q "$1" 2>/dev/null)" ]; }
 # 容器运行时用 exec；容器停着时必须用 run --rm（exec 要求容器在跑）
 panel_node() { docker compose exec -T "$PANEL_SVC" node --no-warnings -e "$1"; }
 # 一次性容器执行：继承服务的卷/环境，但不影响原容器，也不需要它处于运行状态。
@@ -111,7 +113,7 @@ fi
 STAMP="$(date +%Y%m%d-%H%M%S)"
 SAFE="./.restore-backup-$STAMP"
 mkdir -p "$SAFE"
-if running "$PANEL_CTR"; then
+if compose_running "$PANEL_SVC" || running "$PANEL_CTR"; then
   log "先备份当前数据到 $SAFE"
   panel_node '
 const { DatabaseSync, backup } = require("node:sqlite");

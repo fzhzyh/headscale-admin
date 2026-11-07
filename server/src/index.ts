@@ -10,6 +10,7 @@ import { closeDb } from './db/index.ts';
 import { purgeExpiredSessions } from './auth/session.ts';
 import { PANEL_VERSION } from './routes/system.ts';
 import { startPoller, stopPoller, pollOnce } from './realtime/hub.ts';
+import { runRetention } from './db/retention.ts';
 
 // node:sqlite 在 Node 22 仍会打 ExperimentalWarning，这里静音以免污染日志
 const originalEmit = process.emit;
@@ -32,13 +33,20 @@ async function main(): Promise<void> {
   const cfg = loadConfig();
   const app = await buildApp();
 
-  // 定期清理过期会话，避免表无限增长
+  // 每小时维护：清理过期会话 + 按保留期裁剪只增不减的三张表
   const cleanup = setInterval(() => {
     try {
       const n = purgeExpiredSessions();
       if (n > 0) app.log.info({ purged: n }, '已清理过期会话');
     } catch (err) {
       app.log.warn({ err }, '清理会话失败');
+    }
+    try {
+      const purged = runRetention().filter((r) => r.deleted > 0);
+      if (purged.length > 0) app.log.info({ purged }, '已按保留期清理历史数据');
+    } catch (err) {
+      // 清理失败不能影响服务：只记日志，下个小时继续
+      app.log.warn({ err }, '保留期清理失败');
     }
   }, 3600_000);
   cleanup.unref();

@@ -3,10 +3,10 @@
 面向生产环境的完整部署指引。覆盖两种主流拓扑：
 
 - **[场景 A](#场景-a对接已有生产-headscale)**：面板对接**已有的**生产 headscale（最常见）
-- **[场景 B](#场景-b一体化部署面板--headscale-同机新建)**：面板 + headscale 一起从零部署
+- **[场景 B](#场景-b一体化部署headscale--面板单容器)**：headscale + 面板跑在**同一个容器**，从零部署
 
-> 本文所有结论都在真机验证过（Deepin 25 / Docker 29.8.1 / Compose v5.5.1 /
-> InfluxDB 3.12.1 / headscale v0.29.6）。文中列出的报错信息都是实际抓到的原文。
+> 本文所有结论都在真机验证过（Deepin 25 / Docker 29.9.3 / Compose v5.7.0 /
+> InfluxDB 3.12.1 / headscale v0.29.6 与 v0.29.7）。文中列出的报错信息都是实际抓到的原文。
 
 ---
 
@@ -14,7 +14,7 @@
 
 1. [部署前：选拓扑](#一部署前选拓扑)
 2. [场景 A：对接已有生产 headscale](#场景-a对接已有生产-headscale)
-3. [场景 B：一体化部署](#场景-b一体化部署面板--headscale-同机新建)
+3. [场景 B：一体化单容器部署](#场景-b一体化部署headscale--面板单容器)
 4. [TLS 与反向代理](#四tls-与反向代理两场景通用)
 5. [单点登录（OIDC）对接](#五单点登录oidc对接)
 6. [DNS extra-records 对接](#六dns-extra-records-对接)
@@ -37,7 +37,7 @@
 
 ```
 docker-compose.yml              面板（核心，永远需要）
-docker-compose.headscale.yml    headscale（场景 B 才加）
+docker-compose.headscale.yml    把 panel 覆盖为「headscale + 面板」单容器（场景 B 才加）
 docker-compose.metrics.yml      InfluxDB 3.x（要时序数据才加）
 ```
 
@@ -45,7 +45,7 @@ docker-compose.metrics.yml      InfluxDB 3.x（要时序数据才加）
 
 | headscale 在哪 | HS_URL |
 |---|---|
-| 同 compose（场景 B） | `http://headscale:8080` |
+| 一体化单容器（场景 B） | `http://127.0.0.1:8080` |
 | 另一个 compose 项目，共享网络 | `http://headscale:8080` |
 | 另一个 compose 项目，走宿主端口 | `http://host.docker.internal:8080` |
 | 宿主机二进制（systemd） | `http://host.docker.internal:8080` |
@@ -89,7 +89,7 @@ ss -tlnp | grep -E ':3000|:8080'
 ```
 
 > **headscale 版本要求**：v0.26 及以上（有 REST `/api/v1/*`）。本面板在
-> v0.29.6 上验证。更早版本只有 gRPC，本面板未适配。
+> v0.29.6 与 v0.29.7（一体化镜像内置）上验证。更早版本只有 gRPC，本面板未适配。
 
 ### A.2 在 headscale 侧创建 API Key
 
@@ -192,12 +192,35 @@ docker compose exec panel node -e \
 
 ---
 
-## 场景 B：一体化部署（面板 + headscale 同机新建）
+## 场景 B：一体化部署（headscale + 面板，单容器）
 
 ### B.1 与场景 A 的差别
 
-多一个 headscale 容器，且 headscale 的配置文件在本仓库里。**主要工作量在改
-headscale 配置**，不在面板。
+**不是多一个容器，而是把核心文件里的 `panel` 服务整个替换掉**：叠加
+`docker-compose.headscale.yml` 后，只有 `headscale-admin-allinone` 一个容器，
+它同时跑 headscale v0.29.7 与面板。
+
+镜像 `Dockerfile.allinone` 以官方 `headscale/headscale:v0.29.7`（ko 构建的
+Debian 13 distroless）为基底，从 `node:22-bookworm-slim` 抽出 Node 可执行文件
+与 `libstdc++.so.6` / `libgcc_s.so.1` 注入；`scripts/allinone-supervisor.mjs`
+作为 PID 1 托管两个进程。官方镜像没有 `/bin/sh`、没有包管理器，所以不能用
+`sh -c "headscale serve & node ..."`，也装不了 s6-overlay / supervisord。
+
+监督器的关键约定：
+
+- **启动顺序**：先 `headscale serve`，等容器内 8080 端口监听后再起面板；
+- **任一进程退出就终止另一个并让容器重启**，避免「headscale 挂了但面板还
+  显示 healthy」这种半死状态；
+- **SIGTERM/SIGINT 转发给两个进程**，面板才有机会 flush 时序缓冲、关 DB，
+  headscale 才能把 SQLite WAL 落盘；
+- 两个进程的日志分别加 `[headscale]` / `[panel]` 前缀。
+
+数据卷有两个：`panel-data`（面板库 + 自动生成的 API Key）、
+`headscale-data`（headscale 的 SQLite、noise / DERP 私钥），**都要备份**。
+
+> 真机验证：Deepin 25 / Docker 29.9.3 / Compose v5.7.0，
+> 单容器健康检查 `healthy: panel + headscale`，面板首轮采样
+> `GET /api/v1/node` 返回 200。
 
 ### B.2 必须先改 headscale 配置
 
@@ -227,29 +250,37 @@ dns:
 
 ### B.3 启动
 
-分两步起，因为建 API Key 需要 headscale 先跑起来：
+一次起来即可，不再有「先起 headscale 再建 API Key」的鸡生蛋问题：
 
 ```bash
-mkdir -p data/dns
+# .env（关键四项）
+#   HS_URL=http://127.0.0.1:8080      ← 同一个容器走回环
+#   HS_API_KEY=auto                  ← 监督器自动创建并持久化到 /data
+#   PANEL_MASTER_KEY / PANEL_SESSION_SECRET = openssl rand -hex 32
+#   PANEL_ADMIN_SECRET=<自定义强口令> ← 可选，避免随机口令只在日志出现一次
 
-# ① 先只起 headscale
-docker compose up -d headscale
-docker compose ps headscale            # 等到 healthy
+mkdir -p data/dns && echo '[]' > data/dns/extra-records.json
+chmod 755 config config/headscale && chmod 644 config/headscale/config.yaml
 
-# ② 建 API Key
-docker compose exec headscale headscale apikeys create --expiration 999d
-#    → 填回 .env 的 HS_API_KEY
-
-# ③ 再起面板
-docker compose up -d panel
-docker compose logs -f panel
+docker compose up -d --build
+docker compose ps                      # 等到 healthy
+docker compose logs -f panel           # [headscale] / [panel] 两路日志
 ```
 
-> ⚠️ **`HS_URL` 仍必须写**，一体化场景固定为 `http://headscale:8080`。
+`HS_API_KEY=auto` 时，监督器在 headscale 就绪后调 CLI 建一把 999 天有效期的
+Key，写到 `/data/headscale-api-key`（权限 600），之后每次启动复用；重启时会
+探一次上游，key 失效（例如只恢复了其中一个数据卷）就自动重建。此时面板侧
+由 `HS_API_KEY_MANAGED=1` 声明 env 为真源，不会拿着库里残留的旧 key 报 401。
+
+也可以自己执行 `docker exec headscale-admin-allinone /ko-app/headscale apikeys create`
+生成后填进 `.env`。但手工模式下面板只在**首次启动**把 env 引导进 settings 表，
+后续改 `.env` 不生效，要在「设置 → Headscale 连接」里改。
+
+> ⚠️ **`HS_URL` / `HS_API_KEY` 在 .env 里仍必须写**。
 >
-> 这里有个容易想当然的地方：overlay 看起来可以「补默认值」，但**不行**。
-> Compose 的变量插值发生在**每个文件解析时**，不是合并之后 —— 核心文件里的
-> `${HS_URL:?...}` 在解析阶段就因缺值失败了，overlay 没有机会覆盖它。实测：
+> overlay 看起来可以「补默认值」，但**不行**：Compose 的变量插值发生在
+> **每个文件解析时**，不是合并之后 —— 核心文件里的 `${HS_URL:?...}` 在
+> 解析阶段就因缺值失败了，overlay 没有机会覆盖它。实测：
 >
 > ```
 > $ docker compose -f docker-compose.yml -f docker-compose.headscale.yml config
@@ -257,32 +288,45 @@ docker compose logs -f panel
 > required variable HS_URL is missing a value
 > ```
 >
-> 保留必填是刻意的：宁可启动时报错让人明确知道要连哪里，也不要靠隐式默认值。
-> 默认值一旦与实际拓扑不符，故障表现是「容器起来了但连不上」，
-> 比直接报错难查得多。
+> 因此 overlay 里用字面量 `HS_URL: http://127.0.0.1:8080` 覆盖，
+> .env 里只要有一个非空占位值就不会解析失败。
 
-### B.4 验证 headscale 自身
+> ⚠️ **配置文件权限**：核心编排做了 `cap_drop: ALL` 加固，root 失去
+> `DAC_OVERRIDE` 后读不了 0600 的只读挂载、也穿不过 0750 的父目录，
+> 实测报 `fatal error reading config file: permission denied`。
+> overlay 已显式补回 `cap_add: [DAC_OVERRIDE]`；若不想放开这一项，
+> 按上面的 `chmod` 把配置改成全局可读后删掉 `cap_add` 即可。
+
+### B.4 验证两个进程
 
 ```bash
-# 容器内健康
-docker compose exec headscale headscale health
+# 容器健康检查（同时探面板 HTTP + headscale TCP）
+docker inspect --format '{{.State.Health.Status}}' headscale-admin-allinone
 
-# 从宿主机看（端口默认只绑回环）
+# 面板（宿主端口由 PANEL_PORT 控制）
+curl -s localhost:3000/api/system/health
+
+# headscale（宿主端口由 HS_HOST_PORT 控制）
 curl -s localhost:8080/health
 curl -s localhost:8080/version
 
 # 节点列表（应为空）
-curl -s -H "Authorization: Bearer $HS_API_KEY" localhost:8080/api/v1/node | head -c 200
+KEY=$(docker exec headscale-admin-allinone /usr/local/bin/node -e \
+  "process.stdout.write(require('fs').readFileSync('/data/headscale-api-key','utf8'))")
+curl -s -H "Authorization: Bearer $KEY" localhost:8080/api/v1/node | head -c 200
 ```
+
+> 镜像是 distroless：容器里**没有 cat / curl / sh**。读文件、跑一次性检查
+> 都用 `/usr/local/bin/node -e`，CLI 用 `/ko-app/headscale`。
 
 ### B.5 客户端接入
 
 ```bash
 # 建用户
-docker compose exec headscale headscale users create alice
+docker exec headscale-admin-allinone /ko-app/headscale users create alice
 
 # 建预授权密钥（把 <用户ID> 换成上一步返回的 id）
-docker compose exec headscale headscale preauthkeys create --user <用户ID> --expiration 24h
+docker exec headscale-admin-allinone /ko-app/headscale preauthkeys create --user <用户ID> --expiration 24h
 
 # 客户端（另一台设备）
 tailscale up --login-server https://hs.example.com --authkey <上一步的密钥>
@@ -432,9 +476,9 @@ oidc:
 ```
 
 ```bash
-# ④ 重启
-docker compose restart headscale
-docker compose logs -f headscale | grep -i oidc
+# ④ 重启（场景 B 是单容器，重启 panel 服务会同时重启 headscale 与面板）
+docker compose restart panel
+docker compose logs -f panel | grep -i oidc
 ```
 
 ### 5.3 常见失败
@@ -471,7 +515,7 @@ echo '[]' > data/dns/extra-records.json
 
 | headscale 部署方式 | 做法 |
 |---|---|
-| 场景 B（同 compose） | 已配好：两边都挂 `./data/dns` → `/dns` |
+| 场景 B（一体化单容器） | 已配好：两个进程在同一个容器里，天然看到同一个 `/dns` |
 | 另一个 compose（同机） | 让对方也挂同一个宿主机目录 |
 | 宿主机二进制 | headscale 的 `extra_records_path` 指向宿主机上的 `./data/dns/extra-records.json` |
 | 另一台机器 | 需要共享存储（NFS 等），否则**不要启用这个功能** |
@@ -626,19 +670,22 @@ docker compose up -d panel
 > 从新版本回滚到旧版本时，旧代码可能不认识新加的表/列。
 > 保险做法是连同备份一起回滚：`git checkout <tag>` + 恢复对应日期的备份。
 
-### 8.3 headscale 升级（场景 B）
+### 8.3 headscale 升级（场景 B 单容器）
+
+headscale 版本由**构建参数**决定（最终镜像的 `FROM`），不是运行期拉取的独立镜像，
+所以升级要重新构建一体化镜像：
 
 ```bash
-# 1. 备份（用统一脚本，会短暂停 headscale 保证数据一致）
+# 1. 备份（用统一脚本，会短暂停容器保证数据一致）
 sudo ./scripts/backup.sh
 
 # 2. 改 .env 的 HEADSCALE_IMAGE
 sed -i 's|HEADSCALE_IMAGE=.*|HEADSCALE_IMAGE=headscale/headscale:v0.30.0|' .env
 
-# 3. 重建
-docker compose pull headscale
-docker compose up -d headscale
-docker compose logs -f headscale | grep -iE "error|fatal|deprecat"
+# 3. 重新构建并重建容器（两个进程一起换版本）
+docker compose build panel
+docker compose up -d panel
+docker compose logs -f panel | grep -iE "error|fatal|deprecat"
 ```
 
 > **为什么不用 `headscale dump`**：这个命令不存在。实测 `headscale dump`
@@ -735,7 +782,7 @@ Bind for 0.0.0.0:8080 failed: port is already allocated
 改 `.env` 里的宿主端口，容器内端口不要动：
 
 ```bash
-HS_PORT=18080        # headscale
+HS_HOST_PORT=18080   # headscale（场景 B 单容器的宿主发布端口）
 PANEL_PORT=13000     # 面板
 INFLUX_PORT=18086    # 时序库
 ```
@@ -750,7 +797,9 @@ INFLUX_PORT=18086    # 时序库
 | `getting DERPMap: ... TLS handshake timeout` | 配了 `derp.urls` 拉远程地图但外网不通。删掉 `urls` 用内置 DERP |
 | `dns.nameservers.global must be set when dns.override_local_dns is true` | v0.29 是 fatal，不是警告。补 `nameservers.global` |
 | `table ... not found` / `stat /dns/extra-records.json` | extra_records 文件不存在。`echo '[]' > data/dns/extra-records.json` |
-| 容器 `Exited (0)` 且日志只有 usage | 忘写 `command: serve`。官方镜像没有默认 CMD |
+| 容器 `Exited (0)` 且日志只有 usage | 官方镜像没有默认 CMD。一体化镜像的监督器已固定传 `serve`，见到这条说明 ENTRYPOINT 被覆盖过 |
+| `fatal error reading config file: ... permission denied` | `cap_drop: ALL` 下 root 无 DAC_OVERRIDE，读不了 0600 的只读挂载。overlay 已补 `cap_add: [DAC_OVERRIDE]`，或把配置 `chmod 644` + 父目录 `chmod 755` |
+| 容器反复重启、日志里 `[headscale] FTL` | 监督器按设计终止另一个进程并退出，让 `restart: unless-stopped` 拉起整个容器。先看 headscale 的首条 FTL 原因 |
 
 ---
 

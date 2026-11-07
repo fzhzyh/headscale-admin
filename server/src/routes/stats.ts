@@ -197,46 +197,86 @@ ORDER BY time`;
 
   // ---------------------------------------------------------------- 全节点概览
   app.get('/api/stats/overview', { preHandler: requirePermission('node:read') }, async (_req, reply) => {
-    const sql = `SELECT time, node_id, name, online
+    /**
+     * ⚠️ 这里**不能**把 24 小时的全部原始采样点拉回来在 JS 里聚合。
+     *
+     * 量级：15s 采样 × 24h = 5760 点/设备；50 台设备就是 28.8 万行，
+     * 每行都要 JSON.parse + new Date() + Map 查找，单次请求能吃掉几十 MB 堆，
+     * 且这是看板每 60s 自动刷新的接口——会把 GC 拖成持续抖动。
+     *
+     * 改为在时序库里聚合：
+     *   · 聚合查询 → 只回 N 行（N = 设备数），计数/观测窗口一次算完
+     *   · 最新状态另用窗口函数取每台设备的最新一行 → 再回 N 行
+     * 内存从 O(采样点) 降到 O(设备数)，这是数量级的差别。
+     */
+    const aggSql = `SELECT node_id,
+       max(name) AS name,
+       count(*) AS total_samples,
+       sum(CASE WHEN online >= 1 THEN 1 ELSE 0 END) AS online_samples,
+       min(time) AS first_t,
+       max(time) AS last_t
 FROM node_status
 WHERE time >= now() - INTERVAL '24 hours'
-ORDER BY time`;
-    const { rows, error } = await querySql(sql);
-    if (error) return reply.send({ degraded: true, error, nodes: [] });
+GROUP BY node_id`;
 
-    // 按 node_id 聚合：取最后一次状态 + 在线点占比
-    const byNode = new Map<string, { name: string; last: number; onlineSamples: number; totalSamples: number; firstT: number; lastT: number }>();
-    for (const r of rows) {
-      const id = r.node_id === null || r.node_id === undefined ? '' : String(r.node_id);
-      if (!id || !r.time) continue;
-      const t = new Date(String(r.time)).getTime();
-      if (!Number.isFinite(t)) continue;
-      const v = num(r.online) ?? 0;
-      const name = r.name === null || r.name === undefined || r.name === '' ? id : String(r.name);
-      const cur = byNode.get(id);
-      if (!cur) {
-        byNode.set(id, { name, last: v, onlineSamples: v >= 1 ? 1 : 0, totalSamples: 1, firstT: t, lastT: t });
-      } else {
-        cur.totalSamples += 1;
-        if (v >= 1) cur.onlineSamples += 1;
-        if (t >= cur.lastT) {
-          cur.lastT = t;
-          cur.last = v;
-          cur.name = name || cur.name;
+    const { rows, error } = await querySql(aggSql);
+    if (error) return reply.send({ degraded: true, error, nodes: [] });
+    if (rows.length === 0) return reply.send({ degraded: false, windowHours: 24, nodes: [] });
+
+    /**
+     * 每台设备的最新一行（决定「当前在线」）。
+     * 优先用窗口函数；万一当前 InfluxDB 版本不支持，退回「倒序取有限行 + 首见即最新」
+     * 的兜底路径——结果同样正确，只是多回有限行（不随采样总量增长）。
+     */
+    const lastById = new Map<string, boolean>();
+    const lastSql = `SELECT node_id, online, time FROM (
+  SELECT node_id, online, time,
+         row_number() OVER (PARTITION BY node_id ORDER BY time DESC) AS rn
+  FROM node_status
+  WHERE time >= now() - INTERVAL '24 hours'
+) t WHERE rn = 1`;
+    const lastRes = await querySql(lastSql);
+    if (!lastRes.error) {
+      for (const r of lastRes.rows) {
+        const id = r.node_id === null || r.node_id === undefined ? '' : String(r.node_id);
+        if (id) lastById.set(id, (num(r.online) ?? 0) >= 1);
+      }
+    } else {
+      // 兜底：只取最近一段（有界），按时间倒序，首次出现即最新
+      const cap = Math.max(1000, rows.length * 8);
+      const fb = await querySql(
+        `SELECT node_id, online, time FROM node_status
+WHERE time >= now() - INTERVAL '24 hours'
+ORDER BY time DESC LIMIT ${cap}`,
+      );
+      if (!fb.error) {
+        for (const r of fb.rows) {
+          const id = r.node_id === null || r.node_id === undefined ? '' : String(r.node_id);
+          if (id && !lastById.has(id)) lastById.set(id, (num(r.online) ?? 0) >= 1);
         }
-        if (t < cur.firstT) cur.firstT = t;
       }
     }
 
-    const nodes = [...byNode.entries()].map(([id, v]) => ({
-      nodeId: Number(id),
-      name: v.name,
-      lastOnline: v.last >= 1,
-      sampleRatio: v.totalSamples > 0 ? Math.round((v.onlineSamples / v.totalSamples) * 1000) / 1000 : null,
-      sampleCount: v.totalSamples,
-      observedFrom: new Date(v.firstT).toISOString(),
-      observedTo: new Date(v.lastT).toISOString(),
-    })).sort((a, b) => a.nodeId - b.nodeId);
+    const nodes = rows
+      .map((r) => {
+        const id = r.node_id === null || r.node_id === undefined ? '' : String(r.node_id);
+        const name = r.name === null || r.name === undefined || r.name === '' ? id : String(r.name);
+        const total = num(r.total_samples) ?? 0;
+        const onlineSamples = num(r.online_samples) ?? 0;
+        const firstT = r.first_t ? new Date(String(r.first_t)).getTime() : NaN;
+        const lastT = r.last_t ? new Date(String(r.last_t)).getTime() : NaN;
+        return {
+          nodeId: Number(id),
+          name,
+          lastOnline: lastById.get(id) ?? false,
+          sampleRatio: total > 0 ? Math.round((onlineSamples / total) * 1000) / 1000 : null,
+          sampleCount: total,
+          observedFrom: Number.isFinite(firstT) ? new Date(firstT).toISOString() : null,
+          observedTo: Number.isFinite(lastT) ? new Date(lastT).toISOString() : null,
+        };
+      })
+      .filter((n) => Number.isFinite(n.nodeId))
+      .sort((a, b) => a.nodeId - b.nodeId);
 
     return reply.send({ degraded: false, windowHours: 24, nodes });
   });

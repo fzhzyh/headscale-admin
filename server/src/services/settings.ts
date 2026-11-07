@@ -143,6 +143,14 @@ export function bootstrapSettingsFromEnv(): void {
     const exists = get<{ key: string }>('SELECT key FROM settings WHERE key = ?', key);
     if (!exists) setSetting(key, value);
   }
+  // 一体化单容器：headscale 与面板同容器，API Key 由监督器生成/轮换并随卷持久化。
+  // 这时 env 才是真源，必须覆盖库里可能残留的旧值 —— 否则只恢复其中一个卷、
+  // 或监督器检测到僵尸 key 重建后，面板会一直拿着旧 key 报 401。
+  // 只有监督器显式置位才生效，普通部署仍然遵循「env 仅首次引导」的语义。
+  if (process.env.HS_API_KEY_MANAGED === '1' && cfg.headscale.apiKey !== '') {
+    setSetting('hs.apiKey', cfg.headscale.apiKey);
+  }
+
   // 确保所有定义项都有一行（哪怕空值），便于 UI 渲染
   for (const d of SETTING_DEFS) {
     const exists = get<{ key: string }>('SELECT key FROM settings WHERE key = ?', d.key);
@@ -150,15 +158,46 @@ export function bootstrapSettingsFromEnv(): void {
   }
 }
 
+/**
+ * 设置缓存。
+ *
+ * settings 表是「写少读极多」的典型：`hs()` 装配一次要读 4 个键
+ * （url / apiKey / timeout / tlsSkipVerify），鉴权自检、采样器每轮、
+ * 拓扑请求都会触发装配。原来每次都是 1 次 SQL + 可能 1 次 AES-GCM 解密，
+ * 属于重复劳动。
+ *
+ * 这里用「整表缓存 + 任何写入即整体失效」的最简策略：
+ * 设置项总量只有几十个，内存开销可忽略；
+ * 相比逐键失效，整表失效不可能漏掉某个键，也就不会出现「改了设置但没生效」。
+ */
+let settingsCache: Map<string, string> | null = null;
+
+function loadSettingsCache(): Map<string, string> {
+  if (settingsCache) return settingsCache;
+  const map = new Map<string, string>();
+  const rows = all<{ key: string; value: string | null; is_encrypted: number }>(
+    'SELECT key, value, is_encrypted FROM settings',
+  );
+  const box = secretBox();
+  for (const row of rows) {
+    // 解密失败（主密钥换过）时给空串，与「未配置」等价，不抛错
+    map.set(row.key, row.is_encrypted ? (box.tryDecrypt(row.value) ?? '') : (row.value ?? ''));
+  }
+  settingsCache = map;
+  return map;
+}
+
+/** 让设置缓存失效（所有写入路径都必须调用） */
+export function invalidateSettingsCache(): void {
+  settingsCache = null;
+}
+
 export function getSetting(key: string): string {
   const def = DEF_MAP.get(key);
-  const row = get<{ value: string | null; is_encrypted: number }>(
-    'SELECT value, is_encrypted FROM settings WHERE key = ?',
-    key,
-  );
-  if (!row) return def?.default ?? '';
-  if (row.is_encrypted) return secretBox().tryDecrypt(row.value) ?? '';
-  return row.value ?? '';
+  const map = loadSettingsCache();
+  const hit = map.get(key);
+  if (hit === undefined) return def?.default ?? '';
+  return hit;
 }
 
 export function setSetting(key: string, value: string): void {
@@ -175,6 +214,8 @@ export function setSetting(key: string, value: string): void {
     encrypt ? 1 : 0,
     nowIso(),
   );
+  // 写后立即更新缓存（若已加载），保证「保存设置马上生效」而不是等下次冷读
+  if (settingsCache) settingsCache.set(key, value);
 }
 
 /** 敏感值是否已配置（不回显明文） */

@@ -47,8 +47,38 @@ let status4xx = 0;
 let status5xx = 0;
 /** 启动时刻，用于算平均 rpm */
 const startedAt = Date.now();
-/** 滑动窗口的请求时间戳（最近 60s），用于算实时 rpm */
+
+/**
+ * 最近 60 秒的请求时间戳，用于算实时 rpm。
+ *
+ * ⚠️ 为什么不用 `Array.shift()`：
+ * `shift()` 每次都要把整个数组前移一位，是 **O(n)**。面板一次页面加载会打出
+ * 几十个 API 请求，`while (recent[0] 超时) recent.shift()` 的代价是 O(n²)——
+ * 在 60 秒窗口里堆到上万条时，这一行的耗时能超过真正的业务逻辑。
+ *
+ * 这里改用**环形缓冲 + 读写下标**：写入永远 O(1)，过期只移动下标，
+ * 物理回收等下标走到一定阈值再批量 splice（摊销 O(1)）。
+ */
+const RPM_WINDOW_MS = 60_000;
 const recent: number[] = [];
+/** 逻辑窗口起点（recent 中第一个有效元素的下标） */
+let recentHead = 0;
+
+function pruneRecent(now: number): void {
+  while (recentHead < recent.length && now - (recent[recentHead] ?? now) > RPM_WINDOW_MS) {
+    recentHead += 1;
+  }
+  // 下标推进太多时做一次物理压缩，避免数组无限增长（摊销 O(1)）
+  if (recentHead > 1024 && recentHead * 2 > recent.length) {
+    recent.splice(0, recentHead);
+    recentHead = 0;
+  }
+}
+
+function recentCount(now: number): number {
+  pruneRecent(now);
+  return recent.length - recentHead;
+}
 
 /** 把 `/api/nodes/123/rename` 归一化成 `/api/nodes/:id/rename` */
 export function normalizePath(path: string): string {
@@ -77,11 +107,10 @@ export function recordRequest(method: string, path: string, status: number, dura
     latencyIdx += 1;
   }
 
-  // 实时 rpm 窗口
+  // 实时 rpm 窗口：写入 O(1)，过期只移动下标
   const now = Date.now();
   recent.push(now);
-  // 只保留最近 60s，防止数组无限增长
-  while (recent.length > 0 && now - (recent[0] ?? now) > 60_000) recent.shift();
+  pruneRecent(now);
 
   // 路由计数
   const key = `${method} ${normalizePath(path)}`;
@@ -117,9 +146,18 @@ export interface PanelMetrics {
   windowSec: 60;
 }
 
+/**
+ * 面板指标快照。
+ *
+ * 性能注意：`latencyRing` 最多 512 个样本，每次调用都要复制+排序（O(n log n)）。
+ * 该函数被 `/api/stats/panel` 和**每轮采样器**调用，所以加一个 1 秒的结果缓存：
+ * 运维看板上的分位数本来也不需要亚秒级新鲜度。
+ */
+let metricsMemo: { at: number; value: PanelMetrics } | null = null;
+
 export function panelMetrics(): PanelMetrics {
   const now = Date.now();
-  while (recent.length > 0 && now - (recent[0] ?? now) > 60_000) recent.shift();
+  if (metricsMemo && now - metricsMemo.at < 1000) return metricsMemo.value;
 
   const sorted = [...latencyRing].sort((a, b) => a - b);
   const topRoutes = [...routeMap.entries()]
@@ -132,9 +170,9 @@ export function panelMetrics(): PanelMetrics {
     .sort((a, b) => b.count - a.count)
     .slice(0, TOP_N);
 
-  return {
+  const value: PanelMetrics = {
     total,
-    rpm: recent.length,
+    rpm: recentCount(now),
     status: { s2xx: status2xx, s3xx: status3xx, s4xx: status4xx, s5xx: status5xx },
     // 分母为 0 时返回 null：没有请求 ≠ 没有错误
     errorRate: total > 0 ? Math.round((status5xx / total) * 10000) / 10000 : null,
@@ -148,6 +186,8 @@ export function panelMetrics(): PanelMetrics {
     uptimeSec: Math.round((now - startedAt) / 1000),
     windowSec: 60,
   };
+  metricsMemo = { at: now, value };
+  return value;
 }
 
 /** 测试用：清空全部计数 */
@@ -156,6 +196,8 @@ export function __resetMetrics(): void {
   latencyIdx = 0;
   routeMap.clear();
   recent.length = 0;
+  recentHead = 0;
+  metricsMemo = null;
   total = 0;
   status2xx = 0;
   status3xx = 0;

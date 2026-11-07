@@ -95,6 +95,9 @@ export default function AppLayout(): React.ReactElement {
           void qc.invalidateQueries({ queryKey: ['nodes'] });
           void qc.invalidateQueries({ queryKey: ['hs-users'] });
           void qc.invalidateQueries({ queryKey: ['overview'] });
+          // 拓扑的「互通状态」随节点/在线状态变化而变化，必须一起失效，
+          // 否则页面会拿旧数据画颜色——那比不显示更危险。
+          void qc.invalidateQueries({ queryKey: ['topology'] });
           break;
         case 'routes.changed':
           void qc.invalidateQueries({ queryKey: ['routes'] });

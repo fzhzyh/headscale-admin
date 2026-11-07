@@ -1,25 +1,39 @@
 /**
- * 网络拓扑页
+ * 网络拓扑页（树状结构）
  *
- * 用 React Flow 画「用户 → 设备」两层拓扑，边来自 ACL 逐对求值结果。
+ * ## 为什么是树
+ * 数据面是 WireGuard：**所有设备都接入同一张由控制面协调的加密虚拟网络**，
+ * 设备与设备之间不存在「一对一专用链路」。旧版按 ACL 逐对求值画 N×(N-1) 条
+ * 箭头，那是在暗示一种并不存在的物理连接：设备一多就糊成一团，
+ * 而且「少画一条线」会被读成「不允许访问」——这种误读比没有图更危险。
  *
- * ## 布局为什么是**确定性**的（不用力导向）
- * 力导向布局每次渲染位置都在抖，用户没法建立空间记忆，截图也无可比性。
- * 这里按「用户分列 + 设备竖排」排布：同一用户横坐标固定，设备纵坐标递增。
- * 好处是刷新/过滤后同一台设备位置不变，一眼能看出「谁少了、谁多了」。
+ * 现在的结构是两层树：
  *
- * ## 三种策略模式必须区别对待
- * 全通 / 全禁时不画逐对连线（N² 条箭头会糊成一团且无信息量），
- * 改为醒目横幅说明结论。只有「规则模式」才画边。
+ *      [ WireGuard 虚拟专用网络 (VPC) ]      ← 第一层（唯一根）
+ *         │      │      │      │
+ *         ●      ●      ●      ●            ← 第二层：设备，各自与 VPC 相连
  *
- * ## 边代表什么（防止误读）
- * 边 = **控制面 ACL 放行关系**，不代表有数据流量经过。
- * headscale 是控制面，数据面 WireGuard 流量在设备间直连。
- * 这句说明直接写在页脚，而不是只在文档里。
+ * 设备之间不画线。连线只表达「这台设备当前是否在这张网里、状态是否健康」。
+ *
+ * ## 颜色语义（由后端 `reachStatus` 决定，前端只负责呈现）
+ * | 颜色 | 状态      | 含义 |
+ * |------|-----------|------|
+ * | 绿   | `ok`      | 与**全部在线设备**双向可达 |
+ * | 橙   | `partial` | 存在无法互通的在线设备 → **悬停时高亮那些设备** |
+ * | 灰   | `offline` | 设备离线，不参与互通判定 |
+ *
+ * 「互通」是**双向**判定的（后端做）。单向放行是最常见的故障形态，
+ * 只判单向会把它显示成绿色，正好掩盖了问题。
+ *
+ * ## 悬停交互为什么用 Context 而不是重建节点
+ * 悬停如果靠「改 node.data 再重建 nodes 数组」实现，每次 mousemove 都要重建
+ * N 个节点对象并让 React Flow 全量 diff——几十台设备时肉眼可见地卡。
+ * 这里把悬停态放进 Context，只有消费它的节点组件重渲染，
+ * 位置与节点数组保持稳定（`useMemo` 只依赖数据本身与列数）。
  */
-import { useCallback, useMemo, useState } from 'react';
+import { createContext, useContext, useMemo, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
-import { Alert, Spin, Switch, Tag, Tooltip, Segmented, Empty } from 'antd';
+import { Alert, Empty, Spin, Switch, Tag, Tooltip } from 'antd';
 import {
   Background,
   BackgroundVariant,
@@ -37,25 +51,112 @@ import { InfoCircleOutlined } from '@ant-design/icons';
 
 import { api, errorText } from '../api/client';
 import type { TopologyResponse, TopologyNode } from '../api/types';
-import { PageHeader, StatePill } from '../components/ui';
+import { PageHeader } from '../components/ui';
 import { useAuth } from '../store/auth';
 
-// ---------------------------------------------------------------- 自定义设备节点
+// ============================================================
+// 悬停上下文：当前悬停的设备 + 它无法互通的设备集合
+// ============================================================
+interface HoverState {
+  hoveredId: string | null;
+  /** 悬停设备的不可互通集合（仅当悬停的是 partial 设备时非空） */
+  unreachable: Set<number>;
+}
+
+const HoverCtx = createContext<HoverState>({ hoveredId: null, unreachable: new Set() });
+
+// ============================================================
+// 状态 → 配色（单一真源：图例、节点、连线都从这里取，避免三处写死颜色漂移）
+// ============================================================
+const STATUS_STYLE = {
+  ok: {
+    label: '互通正常',
+    dot: 'bg-emerald-500',
+    ring: 'border-emerald-300',
+    edge: '#10b981',
+    text: 'text-emerald-700',
+  },
+  partial: {
+    label: '存在不通的设备',
+    dot: 'bg-amber-500',
+    ring: 'border-amber-300',
+    edge: '#f59e0b',
+    text: 'text-amber-700',
+  },
+  offline: {
+    label: '离线',
+    dot: 'bg-ink-300',
+    ring: 'border-ink-200',
+    edge: '#94a3b8',
+    text: 'text-ink-500',
+  },
+} as const;
+
+type StatusKey = keyof typeof STATUS_STYLE;
+
+// ============================================================
+// 自定义节点：VPC 根节点（第一层）
+// ============================================================
+function VpcNode({ data }: NodeProps): React.ReactElement {
+  const d = data as unknown as { label: string; subLabel: string; online: number; total: number };
+  return (
+    <div
+      className="w-[260px] rounded-2xl border-2 border-brand-300 bg-gradient-to-br from-brand-50 to-white px-4 py-3 shadow-md"
+      data-testid="topo-vpc"
+    >
+      <div className="flex items-center gap-2">
+        <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-gradient-to-br from-brand-500 to-brand-700 text-[12px] font-bold text-white">
+          WG
+        </span>
+        <div className="min-w-0">
+          <div className="truncate text-[13px] font-semibold text-ink-800">{d.label}</div>
+          <div className="truncate text-[10.5px] text-ink-400">{d.subLabel}</div>
+        </div>
+      </div>
+      <div className="mt-2 flex items-center gap-2 text-[11px] text-ink-500">
+        <Tag color="blue" className="!m-0 !px-1.5 !text-[10.5px]">
+          在线 {d.online}
+        </Tag>
+        <span>设备 {d.total} 台</span>
+      </div>
+      <Handle type="source" position={Position.Bottom} className="!h-2 !w-2 !border-0 !bg-brand-500" />
+    </div>
+  );
+}
+
+// ============================================================
+// 自定义节点：设备（第二层）
+// ============================================================
 type DeviceNodeData = TopologyNode & { [key: string]: unknown };
 
 function DeviceNode({ data }: NodeProps): React.ReactElement {
   const n = data as unknown as DeviceNodeData;
-  const dot = n.expired ? 'bg-rose-500' : n.online ? 'bg-emerald-500' : 'bg-ink-300';
+  const hover = useContext(HoverCtx);
+  const style = STATUS_STYLE[n.reachStatus] ?? STATUS_STYLE.offline;
+  const selfId = String(n.id);
+
+  const isHovered = hover.hoveredId === selfId;
+  const isUnreachable = hover.unreachable.has(n.id);
+  // 悬停时其它不相关设备淡出，把注意力集中到「不通的那几台」
+  const dimmed = hover.hoveredId !== null && !isHovered && !isUnreachable;
+
+  const ringClass = isHovered
+    ? 'border-brand-500 shadow-lg'
+    : isUnreachable
+      ? 'border-rose-400 shadow-[0_0_0_3px_rgba(244,63,94,0.22)]'
+      : style.ring;
+
   return (
     <div
-      className={`w-[190px] rounded-xl border bg-white px-3 py-2.5 shadow-sm transition-shadow hover:shadow-md ${
-        n.online ? 'border-brand-200' : 'border-ink-200'
+      className={`w-[196px] rounded-xl border bg-white px-3 py-2.5 shadow-sm transition-all duration-150 ${ringClass} ${
+        dimmed ? 'opacity-25' : 'opacity-100'
       }`}
       data-testid={`topo-node-${n.id}`}
+      data-status={n.reachStatus}
     >
-      <Handle type="target" position={Position.Left} className="!h-1.5 !w-1.5 !border-0 !bg-ink-300" />
+      <Handle type="target" position={Position.Top} className="!h-2 !w-2 !border-0 !bg-ink-300" />
       <div className="flex items-center gap-1.5">
-        <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${dot}`} />
+        <span className={`h-2 w-2 shrink-0 rounded-full ${style.dot}`} />
         <span className="truncate text-[12.5px] font-semibold text-ink-800" title={n.displayName}>
           {n.displayName}
         </span>
@@ -68,6 +169,17 @@ function DeviceNode({ data }: NodeProps): React.ReactElement {
         )}
       </div>
       <div className="mt-1 truncate font-mono text-[10.5px] text-ink-400">{n.ips[0] ?? '—'}</div>
+
+      {/* 状态行：一眼看出「为什么是橙的」 */}
+      <div className="mt-1 flex items-center gap-1.5">
+        <span className={`text-[10.5px] font-medium ${style.text}`}>
+          {n.reachStatus === 'offline' ? '离线' : style.label}
+        </span>
+        {n.reachStatus === 'partial' && n.unreachableCount > 0 && (
+          <span className="text-[10px] text-rose-500">· {n.unreachableCount} 台不通</span>
+        )}
+      </div>
+
       {n.tags.length > 0 && (
         <div className="mt-1 flex flex-wrap gap-1">
           {n.tags.slice(0, 2).map((t) => (
@@ -82,87 +194,142 @@ function DeviceNode({ data }: NodeProps): React.ReactElement {
           子网 {n.approvedRoutes.length} 条
         </div>
       )}
-      <Handle type="source" position={Position.Right} className="!h-1.5 !w-1.5 !border-0 !bg-brand-400" />
     </div>
   );
 }
 
-const nodeTypes = { device: DeviceNode };
+const nodeTypes = { vpc: VpcNode, device: DeviceNode };
 
-// ---------------------------------------------------------------- 页面
+// ============================================================
+// 布局：确定性树
+// ============================================================
+const NODE_W = 196;
+const COL_GAP = 56;
+const ROW_GAP = 40;
+const NODE_H = 96;
+const ROOT_W = 260;
+const ROOT_TO_DEVICE_GAP = 130;
+
+/**
+ * 把设备排成矩形网格挂在根节点下方，根节点水平居中。
+ *
+ * 为什么不用力导向布局：力导向每次渲染位置都在抖，用户没法建立空间记忆，
+ * 截图也不可比。这里按固定列宽/行高排列，同一台设备刷新后位置不变，
+ * 一眼就能看出「谁多了、谁少了」。
+ */
+function buildLayout(
+  nodes: TopologyNode[],
+  cols: number,
+  vpc: { label: string; subLabel: string; online: number; total: number },
+): Node[] {
+  const colW = NODE_W + COL_GAP;
+  const rowH = NODE_H + ROW_GAP;
+
+  const totalCols = Math.max(1, Math.min(cols, nodes.length || 1));
+  const gridW = totalCols * colW - COL_GAP;
+  const rootX = (gridW - ROOT_W) / 2;
+
+  const vpcNode: Node = {
+    id: 'vpc',
+    type: 'vpc',
+    position: { x: Math.max(0, rootX), y: 0 },
+    draggable: false,
+    data: { ...vpc },
+  };
+
+  const deviceNodes: Node[] = nodes.map((n, i) => {
+    const col = i % totalCols;
+    const row = Math.floor(i / totalCols);
+    return {
+      id: String(n.id),
+      type: 'device',
+      position: { x: col * colW, y: ROOT_TO_DEVICE_GAP + row * rowH },
+      data: { ...n },
+    };
+  });
+
+  return [vpcNode, ...deviceNodes];
+}
+
+// ============================================================
+// 页面
+// ============================================================
 export default function TopologyPage(): React.ReactElement {
   const { can } = useAuth();
-  const [onlineOnly, setOnlineOnly] = useState(false);
-  const [highlight, setHighlight] = useState<number | null>(null);
+  const [hideOffline, setHideOffline] = useState(false);
+  const [hoveredId, setHoveredId] = useState<string | null>(null);
 
   const q = useQuery({
-    queryKey: ['topology', onlineOnly],
-    queryFn: () => api.get<TopologyResponse>('/api/topology', { onlineOnly: onlineOnly ? '1' : '0' }),
-    refetchInterval: 30_000,
+    queryKey: ['topology'],
+    queryFn: () => api.get<TopologyResponse>('/api/topology'),
+    // 实时性靠 WebSocket 失效缓存（AppLayout 收到 nodes.changed 会 invalidate ['topology']）；
+    // 这里的轮询只是「WS 断线时」的兜底，所以间隔可以放长。
+    refetchInterval: 60_000,
   });
 
   const data = q.data;
 
-  // 确定性布局：按用户分列，列内竖排
-  const { flowNodes, flowEdges } = useMemo(() => {
-    if (!data) return { flowNodes: [] as Node[], flowEdges: [] as Edge[] };
+  const visibleNodes = useMemo(() => {
+    if (!data) return [] as TopologyNode[];
+    return hideOffline ? data.nodes.filter((n) => n.online) : data.nodes;
+  }, [data, hideOffline]);
 
-    const users = [...new Set(data.nodes.map((n) => n.user ?? 'tagged-devices'))].sort((a, b) =>
-      a === 'tagged-devices' ? 1 : b === 'tagged-devices' ? -1 : a.localeCompare(b),
-    );
+  // 列数：按设备数自适应，保持接近横向排布（纯竖排会让 560px 高度装不下）
+  const cols = useMemo(() => {
+    const n = visibleNodes.length;
+    if (n <= 1) return 1;
+    return Math.min(n, Math.max(2, Math.ceil(Math.sqrt(n * 1.6))));
+  }, [visibleNodes.length]);
 
-    const COL_W = 300;
-    const ROW_H = 96;
-    const byUser = new Map<string, TopologyNode[]>();
-    for (const n of data.nodes) {
-      const u = n.user ?? 'tagged-devices';
-      const arr = byUser.get(u) ?? [];
-      arr.push(n);
-      byUser.set(u, arr);
-    }
+  // 悬停设备「无法互通」的集合：只有橙色设备需要高亮
+  const hover: HoverState = useMemo(() => {
+    if (!data || !hoveredId) return { hoveredId: null, unreachable: new Set<number>() };
+    const n = data.nodes.find((x) => String(x.id) === hoveredId);
+    if (!n || n.reachStatus !== 'partial') return { hoveredId, unreachable: new Set<number>() };
+    return { hoveredId, unreachable: new Set<number>(n.unreachableIds) };
+  }, [data, hoveredId]);
 
-    const nodes: Node[] = [];
-    users.forEach((u, ci) => {
-      const list = (byUser.get(u) ?? []).sort((a, b) => a.displayName.localeCompare(b.displayName));
-      list.forEach((n, ri) => {
-        nodes.push({
-          id: String(n.id),
-          type: 'device',
-          position: { x: ci * COL_W, y: ri * ROW_H },
-          data: { ...n },
-        });
-      });
+  // 节点数组只依赖数据本身：悬停时不重建 N 个节点对象，React Flow 不用全量 diff。
+  const flowNodes = useMemo(() => {
+    if (!data) return [] as Node[];
+    return buildLayout(visibleNodes, cols, {
+      label: data.vpc.label,
+      subLabel: data.vpc.subLabel,
+      online: data.stats.onlineCount,
+      total: data.stats.nodeCount,
     });
+  }, [data, visibleNodes, cols]);
 
-    // 边：同一对只留一条；高亮时只强调相关边
-    const edges: Edge[] = data.edges.map((e, i) => {
-      const active = highlight === null || e.from === highlight || e.to === highlight;
+  // 悬停只影响连线样式，所以边单独 memo；设备数一般远少于规则对数，代价可忽略。
+  const flowEdges = useMemo(() => {
+    if (!data) return [] as Edge[];
+    return visibleNodes.map((n): Edge => {
+      const style = STATUS_STYLE[n.reachStatus] ?? STATUS_STYLE.offline;
+      const isTarget = hover.unreachable.has(n.id);
+      const isHoveredSelf = hover.hoveredId === String(n.id);
+      const muted = hover.hoveredId !== null && !isTarget && !isHoveredSelf;
       return {
-        id: `e${i}`,
-        source: String(e.from),
-        target: String(e.to),
-        animated: false,
+        id: `vpc-${n.id}`,
+        source: 'vpc',
+        target: String(n.id),
+        type: 'smoothstep',
+        animated: n.reachStatus === 'partial' && !muted,
         style: {
-          stroke: active ? '#2563eb' : '#cbd5e1',
-          strokeWidth: active && highlight !== null ? 1.8 : 1.2,
-          opacity: active ? 0.9 : 0.25,
+          stroke: isTarget ? '#e11d48' : style.edge,
+          strokeWidth: isTarget ? 2.2 : 1.3,
+          strokeDasharray: n.reachStatus === 'offline' ? '6 4' : undefined,
+          opacity: muted ? 0.25 : 0.9,
         },
-        markerEnd: { type: 'arrowclosed' as never, color: active ? '#2563eb' : '#cbd5e1' },
       };
     });
+  }, [data, visibleNodes, hover]);
 
-    return { flowNodes: nodes, flowEdges: edges };
-  }, [data, highlight]);
-
-  const onNodeClick = useCallback((_: unknown, node: Node) => {
-    const id = Number(node.id);
-    setHighlight((cur) => (cur === id ? null : id));
-  }, []);
+  const hoveredNode = data && hoveredId ? data.nodes.find((n) => String(n.id) === hoveredId) : null;
 
   if (q.isLoading) {
     return (
       <div className="flex h-[60vh] items-center justify-center">
-        <Spin size="large" tip="正在计算拓扑与 ACL 放行关系…" />
+        <Spin size="large" tip="正在计算设备互通状态…" />
       </div>
     );
   }
@@ -183,12 +350,12 @@ export default function TopologyPage(): React.ReactElement {
           type="error"
           showIcon
           className="mb-3"
-          message="当前策略为「全通」——任意两台设备互通，因此不绘制逐对连线"
+          message="当前策略为「全通」——任意两台设备都可互通，全部在线设备显示为绿色"
           description={
             <div className="text-[12.5px]">
               {data.explanation}
               <div className="mt-1 text-ink-500">
-                全通状态下画 N² 条箭头只会糊成一团且没有信息量。要点是这条结论本身。
+                「全通」是 Headscale 在没有任何 acls 规则时的默认行为，意味着<b>没有访问控制</b>。
               </div>
             </div>
           }
@@ -201,7 +368,7 @@ export default function TopologyPage(): React.ReactElement {
           type="warning"
           showIcon
           className="mb-3"
-          message="当前策略为「全禁」——设备之间无法互访，图中没有连线就是结论"
+          message="当前策略为「全禁」——设备之间无法互访，全部在线设备显示为橙色"
           description={<div className="text-[12.5px]">{data.explanation}</div>}
         />
       );
@@ -211,7 +378,7 @@ export default function TopologyPage(): React.ReactElement {
         type="success"
         showIcon
         className="mb-3"
-        message={`规则模式：${data.stats.allowedEdges} 条放行关系（逐对求值 ${data.stats.pairEvaluated} 对）`}
+        message={`规则模式：逐对求值 ${data.stats.pairEvaluated} 对，${data.stats.okCount} 台设备与全部在线设备互通`}
         description={<div className="text-[12.5px] text-ink-600">{data.explanation}</div>}
       />
     );
@@ -221,24 +388,15 @@ export default function TopologyPage(): React.ReactElement {
     <>
       <PageHeader
         title="网络拓扑"
-        description="设备连接关系与 ACL 放行矩阵 · 边来自逐对 ACL 求值"
+        description="树状视图 · 所有设备接入同一张 WireGuard 虚拟网络 · 颜色反映与在线设备的互通状态"
         extra={
           <div className="flex flex-wrap items-center gap-3">
-            <Tooltip title="只显示在线设备之间的连线，减少离线设备造成的视觉噪音">
+            <Tooltip title="离线设备不参与互通判定；勾选后从图中隐藏，减少视觉噪音">
               <span className="flex items-center gap-1.5 text-[12.5px] text-ink-600">
-                只看在线
-                <Switch size="small" checked={onlineOnly} onChange={setOnlineOnly} />
+                隐藏离线
+                <Switch size="small" checked={hideOffline} onChange={setHideOffline} />
               </span>
             </Tooltip>
-            <Segmented
-              size="small"
-              value={highlight === null ? 'all' : 'focus'}
-              onChange={(v) => setHighlight(v === 'all' ? null : (data?.nodes[0]?.id ?? null))}
-              options={[
-                { label: '全部连线', value: 'all' },
-                { label: '聚焦设备', value: 'focus' },
-              ]}
-            />
           </div>
         }
       />
@@ -253,8 +411,9 @@ export default function TopologyPage(): React.ReactElement {
           message={`设备数过多，逐对求值已截断（上限 ${data.stats.maxPairs} 对）`}
           description={
             <span className="text-[12.5px]">
-              已评估 {data.stats.pairEvaluated} 对。图中的边都是<b>实际算过</b>的，
-              未评估的组合不会出现在图上——需要完整结论请用「ACL 管理 → 访问检查」。
+              已评估 {data.stats.pairEvaluated} 对。截断范围内的设备被<b>保守标为橙色</b>——
+              未评估不等于通，宁可显示「可能有问题」也不谎报全通。
+              需要完整结论请用「ACL 管理 → 访问检查」。
             </span>
           }
         />
@@ -267,31 +426,63 @@ export default function TopologyPage(): React.ReactElement {
           </div>
         ) : (
           <div style={{ height: 560 }}>
-            <ReactFlow
-              nodes={flowNodes}
-              edges={flowEdges}
-              nodeTypes={nodeTypes}
-              onNodeClick={onNodeClick}
-              fitView
-              minZoom={0.25}
-              maxZoom={1.6}
-              proOptions={{ hideAttribution: true }}
-              nodesDraggable
-              nodesConnectable={false}
-              elementsSelectable
-            >
-              <Background variant={BackgroundVariant.Dots} gap={16} size={1} color="#e2e8f0" />
-              <Controls showInteractive={false} />
-              <MiniMap
-                pannable
-                zoomable
-                nodeColor={(n) => ((n.data as unknown as DeviceNodeData).online ? '#2563eb' : '#cbd5e1')}
-                style={{ background: '#f8fafc' }}
-              />
-            </ReactFlow>
+            <HoverCtx.Provider value={hover}>
+              <ReactFlow
+                nodes={flowNodes}
+                edges={flowEdges}
+                nodeTypes={nodeTypes}
+                // 根节点不是设备，悬停它不应触发「淡出所有设备」的高亮态
+                onNodeMouseEnter={(_, node) => setHoveredId(node.id === 'vpc' ? null : node.id)}
+                onNodeMouseLeave={() => setHoveredId(null)}
+                onPaneClick={() => setHoveredId(null)}
+                fitView
+                minZoom={0.25}
+                maxZoom={1.6}
+                proOptions={{ hideAttribution: true }}
+                nodesDraggable
+                nodesConnectable={false}
+                elementsSelectable={false}
+              >
+                <Background variant={BackgroundVariant.Dots} gap={16} size={1} color="#e2e8f0" />
+                <Controls showInteractive={false} />
+                <MiniMap
+                  pannable
+                  zoomable
+                  nodeColor={(n) => {
+                    if (n.id === 'vpc') return '#2563eb';
+                    const d = n.data as unknown as DeviceNodeData;
+                    return (STATUS_STYLE[d.reachStatus as StatusKey] ?? STATUS_STYLE.offline).edge;
+                  }}
+                  style={{ background: '#f8fafc' }}
+                />
+              </ReactFlow>
+            </HoverCtx.Provider>
           </div>
         )}
       </div>
+
+      {/* 悬停详情：解释「为什么这几台不通」，而不是只给个橙点 */}
+      {hoveredNode && hoveredNode.reachStatus === 'partial' && hoveredNode.unreachableReasons.length > 0 && (
+        <div className="mt-3 hsa-card border-l-4 !border-l-amber-400 p-3.5">
+          <div className="mb-1.5 flex items-center gap-1.5 text-[13px] font-semibold text-ink-800">
+            <span className="h-2 w-2 rounded-full bg-amber-500" />
+            「{hoveredNode.displayName}」无法与下列在线设备互通
+          </div>
+          <div className="flex flex-wrap gap-1.5">
+            {hoveredNode.unreachableReasons.map((u) => (
+              <Tooltip key={u.id} title={u.reason}>
+                <Tag color="red" className="!m-0 !cursor-default">
+                  {u.name}
+                </Tag>
+              </Tooltip>
+            ))}
+          </div>
+          <div className="mt-1.5 text-[11.5px] text-ink-400">
+            互通按<b>双向</b>判定（A→B 与 B→A 都要放行）。只单向放行也会被判为不通，
+            这是最常见的故障形态。
+          </div>
+        </div>
+      )}
 
       {/* 图例 + 统计 + 语义说明 */}
       <div className="mt-3 grid grid-cols-1 gap-3 lg:grid-cols-3">
@@ -299,20 +490,22 @@ export default function TopologyPage(): React.ReactElement {
           <div className="mb-2 text-[13px] font-semibold text-ink-800">图例</div>
           <div className="space-y-1.5 text-[12px] text-ink-600">
             <div className="flex items-center gap-2">
-              <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" /> 在线
-              <span className="ml-3 h-1.5 w-1.5 rounded-full bg-ink-300" /> 离线
-              <span className="ml-3 h-1.5 w-1.5 rounded-full bg-rose-500" /> 已过期
+              <span className="h-2 w-2 rounded-full bg-emerald-500" />
+              绿色 · 与全部在线设备互通
             </div>
             <div className="flex items-center gap-2">
+              <span className="h-2 w-2 rounded-full bg-amber-500" />
+              橙色 · 存在无法互通的在线设备（悬停高亮）
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="h-2 w-2 rounded-full bg-ink-300" />
+              灰色 · 离线（不参与判定）
+            </div>
+            <div className="mt-1 flex items-center gap-2 text-ink-400">
               <svg width="26" height="8">
-                <line x1="0" y1="4" x2="26" y2="4" stroke="#2563eb" strokeWidth="1.8" markerEnd="url(#a)" />
-                <defs>
-                  <marker id="a" markerWidth="6" markerHeight="6" refX="5" refY="3" orient="auto">
-                    <path d="M0,0 L6,3 L0,6 z" fill="#2563eb" />
-                  </marker>
-                </defs>
+                <line x1="0" y1="4" x2="26" y2="4" stroke="#94a3b8" strokeWidth="1.5" strokeDasharray="5 3" />
               </svg>
-              ACL 放行方向（点击设备可聚焦其连线）
+              虚线 = 设备离线
             </div>
           </div>
         </div>
@@ -322,24 +515,24 @@ export default function TopologyPage(): React.ReactElement {
           {data && (
             <div className="space-y-1.5 text-[12px] text-ink-600">
               <div className="flex justify-between">
-                <span>设备</span>
+                <span>设备总数</span>
                 <span className="font-mono">{data.stats.nodeCount}</span>
               </div>
               <div className="flex justify-between">
-                <span>参与求值</span>
-                <span className="font-mono">{data.stats.consideredCount}</span>
+                <span className="text-emerald-700">互通正常</span>
+                <span className="font-mono text-emerald-700">{data.stats.okCount}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-amber-700">存在不通</span>
+                <span className="font-mono text-amber-700">{data.stats.partialCount}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-ink-500">离线</span>
+                <span className="font-mono text-ink-500">{data.stats.offlineCount}</span>
               </div>
               <div className="flex justify-between">
                 <span>求值对数</span>
                 <span className="font-mono">{data.stats.pairEvaluated}</span>
-              </div>
-              <div className="flex justify-between">
-                <span>放行边数</span>
-                <span className="font-mono text-brand-600">{data.stats.allowedEdges}</span>
-              </div>
-              <div className="flex justify-between">
-                <span>用户 / 分组</span>
-                <span className="font-mono">{data.users.length}</span>
               </div>
             </div>
           )}
@@ -348,37 +541,39 @@ export default function TopologyPage(): React.ReactElement {
         <div className="hsa-card p-4">
           <div className="mb-2 flex items-center gap-1.5 text-[13px] font-semibold text-ink-800">
             <InfoCircleOutlined className="text-ink-400" />
-            这条边代表什么
+            怎么读这张图
           </div>
           <div className="space-y-1.5 text-[11.5px] leading-relaxed text-ink-500">
             <p>
-              边 = <b className="text-ink-700">控制面 ACL 放行关系</b>
-              （与「访问检查」同一套求值引擎），箭头方向即允许方向。
+              连线 = <b className="text-ink-700">设备接入这张虚拟网络</b>，
+              不代表它和另一台设备之间有一条专属链路。所有设备都接入同一个 VPC。
+            </p>
+            <p>
+              颜色由<b className="text-ink-700">控制面 ACL 双向放行关系</b>推导，
+              与「ACL 管理 → 访问检查」用的是同一套求值引擎。
             </p>
             <p>
               <b className="text-ink-700">不代表有数据流量经过。</b>
-              headscale 只在控制面协调握手与下发策略，设备之间的数据面流量是
-              WireGuard 直连的。
+              headscale 只协调握手与下发策略，数据面由 WireGuard 直连或经 DERP 中继。
             </p>
-            <p className="text-ink-400">
-              策略来源：{data?.source ?? '—'}
-            </p>
+            <p className="text-ink-400">策略来源：{data?.source ?? '—'}</p>
           </div>
         </div>
       </div>
 
       <div className="mt-3 text-[11.5px] text-ink-400">
-        提示：点击设备可聚焦其所有连线，再次点击取消。设备位置按用户分列固定排布，
-        刷新后位置不变，便于对比前后差异。
-        {can('acl:read') && (
+        提示：把鼠标移到<b>橙色</b>设备上，会高亮它无法互通的设备并列出不通原因；移开即恢复。
+        需要精确到端口/协议的结论，请用
+        {can('acl:read') ? (
           <>
             {' '}
-            需要精确到端口/协议的结论，请用
-            <a className="ml-1 text-brand-600 hover:underline" href="/acl">
+            <a className="text-brand-600 hover:underline" href="/acl">
               ACL 管理 → 访问检查
             </a>
             。
           </>
+        ) : (
+          ' ACL 管理 → 访问检查。'
         )}
       </div>
     </>

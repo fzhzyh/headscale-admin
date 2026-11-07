@@ -101,7 +101,33 @@ function validateAddr(addr: string, isV6: boolean): boolean {
  *   7. 不含 `@` 且不含 `:` → host
  *   8. 否则非法
  */
+/**
+ * 策略解析函数的有界记忆化。
+ *
+ * 这些都是纯函数，输入来自策略文本（或用户表单），取值集合天然有限。
+ * 但拓扑页会在 O(N²) 循环里对同一条规则的同一别名反复解析：
+ * `splitDestAndPort` 里的 IPv6 校验、`parsePortRange` 的正则、
+ * `parseProtocol` 的对象构造，都会被放大上万倍。
+ * 缓存命中后这部分成本降为一次 Map 查找；容量上限防止畸形策略撑爆内存。
+ * 返回值一律视为只读。
+ */
+const MEMO_MAX = 2048;
+function memoGet<T>(memo: Map<string, T>, key: string, build: () => T): T {
+  const hit = memo.get(key);
+  if (hit !== undefined) return hit;
+  const value = build();
+  if (memo.size >= MEMO_MAX) memo.clear();
+  memo.set(key, value);
+  return value;
+}
+
+const _aliasMemo = new Map<string, PlainAlias | null>();
+
 export function parseAlias(input: string): PlainAlias | null {
+  return memoGet(_aliasMemo, input, () => parseAliasUncached(input));
+}
+
+function parseAliasUncached(input: string): PlainAlias | null {
   const raw = input.trim();
   if (raw === '') return null;
 
@@ -139,7 +165,13 @@ export function isKnownAutoGroup(v: string): v is AutoGroup {
  *   - 端口分隔符是**最后一个**冒号（utils.go:36 用 LastIndex）
  *   - RFC3986 方括号 IPv6：`[fd7a::1]:22`，剥括号后按常规处理
  */
+const _destPortMemo = new Map<string, { dest: string; port: string } | null>();
+
 export function splitDestAndPort(input: string): { dest: string; port: string } | null {
+  return memoGet(_destPortMemo, input, () => splitDestAndPortUncached(input));
+}
+
+function splitDestAndPortUncached(input: string): { dest: string; port: string } | null {
   let s = input.trim();
   if (s.startsWith('[')) {
     const close = s.indexOf(']');
@@ -167,7 +199,13 @@ export interface PortRange {
  * 解析端口定义（utils.go:86 parsePortRange）。
  * 支持单端口、区间、以及 `*`（0-65535）。
  */
+const _portRangeMemo = new Map<string, PortRange[] | null>();
+
 export function parsePortRange(def: string, proto?: string): PortRange[] | null {
+  return memoGet(_portRangeMemo, `${proto ?? ''}\u0000${def}`, () => parsePortRangeUncached(def));
+}
+
+function parsePortRangeUncached(def: string): PortRange[] | null {
   const trimmed = def.trim();
 
   // 协议前缀，如 tcp:443
@@ -205,7 +243,6 @@ export function parsePortRange(def: string, proto?: string): PortRange[] | null 
     out.push({ first: n, last: n });
   }
 
-  void proto;
   void protoName;
   return out.length ? out : null;
 }
@@ -241,7 +278,13 @@ export const PROTOCOL_NAMES: Record<number, string> = Object.fromEntries(
  * headscale 支持协议名、IANA 编号，以及 `*`（但 `*` 会报错：
  * errUnknownProtocolWildcard，要求明确写 0-255 或名称）。
  */
+const _protocolMemo = new Map<string, { number: number; name: string } | null>();
+
 export function parseProtocol(v: string | undefined): { number: number; name: string } | null {
+  return memoGet(_protocolMemo, v ?? '', () => parseProtocolUncached(v));
+}
+
+function parseProtocolUncached(v: string | undefined): { number: number; name: string } | null {
   if (v === undefined || v === '') {
     // 缺省视为 tcp？headscale 的 ACL.Protocol 有默认值，见 Validate
     return { number: PROTOCOL_NUMBERS['tcp']!, name: 'tcp' };

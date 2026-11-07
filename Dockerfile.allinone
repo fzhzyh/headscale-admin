@@ -1,0 +1,162 @@
+# syntax=docker/dockerfile:1
+#
+# headscale-admin 一体化镜像：headscale v0.29.7 + 管理面板，单容器双进程
+#
+# ## 与根 Dockerfile 的区别
+# | | Dockerfile（对接已有 headscale） | 本文件（一体化） |
+# |---|---|---|
+# | 最终基底 | node:22-alpine | **headscale/headscale:v0.29.7**（官方 distroless） |
+# | 进程 | 只有面板 | headscale serve + 面板，由 Node 监督器托管 |
+# | 端口 | 3000 | 3000（面板）+ 8080（headscale）+ 3478/udp（内置 DERP） |
+# | 数据卷 | /data | /data + /var/lib/headscale |
+#
+# ## 为什么能把 Node 塞进 distroless
+# 官方 headscale v0.29.7 是 ko 构建的 Debian 13 distroless：
+#   · 有 glibc / libnss_* / ca-certificates，但**没有 /bin/sh、没有包管理器**
+#   · ENTRYPOINT = /ko-app/headscale，二进制是静态链接的 Go 程序
+#   · 缺的只有 Node 需要的 libstdc++.so.6 与 libgcc_s.so.1
+# 所以从 node:22-bookworm-slim 里抠出 `node` 可执行文件 + 这两个库，
+# 用 LD_LIBRARY_PATH 指过去即可；比「以 Node 为基底再拷 headscale」更贴合
+# 「基于官方 headscale 镜像构建」，镜像里也不会多出一套 shell / apt。
+#
+# ## 构建
+#   docker build -f Dockerfile.allinone -t headscale-admin-allinone:v0.29.7 .
+#
+#   # 国内网络
+#   docker build -f Dockerfile.allinone \
+#     --build-arg NODE_IMAGE=docker.m.daocloud.io/library/node:22-bookworm-slim \
+#     --build-arg NPM_REGISTRY=https://registry.npmmirror.com \
+#     -t headscale-admin-allinone:v0.29.7 .
+#
+# ## 构建参数
+#   HEADSCALE_IMAGE  官方镜像 tag，默认 headscale/headscale:v0.29.7
+#   NODE_IMAGE       构建/取运行时用的 Node 镜像，必须 glibc 版（bookworm/trixie-slim）
+#   NPM_REGISTRY     npm 源
+#   PANEL_VERSION    OCI label 用，留空即从 package.json 读
+
+ARG NODE_IMAGE=node:22-bookworm-slim
+ARG HEADSCALE_IMAGE=headscale/headscale:v0.29.7
+
+# ============================================================
+# 阶段 1：构建面板（与根 Dockerfile 完全一致，复用同一套 lockfile / 类型检查）
+# ============================================================
+FROM ${NODE_IMAGE} AS panel-build
+
+ARG NPM_REGISTRY=https://registry.npmjs.org
+WORKDIR /app
+
+RUN if [ "${NPM_REGISTRY}" != "https://registry.npmjs.org" ]; then \
+      printf 'registry=%s\nfund=false\naudit=false\n' "${NPM_REGISTRY}" > /root/.npmrc; \
+    fi
+
+COPY package.json package-lock.json ./
+COPY server/package.json server/package.json
+COPY web/package.json web/package.json
+
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci --no-audit --no-fund
+
+COPY tsconfig.base.json ./
+COPY server/ server/
+COPY web/ web/
+COPY scripts/ scripts/
+
+RUN V="$(node -p "require('./package.json').version")" && \
+    node scripts/set-version.mjs --check "${V}" && \
+    npm run typecheck && npm run build
+
+RUN find server/dist web/dist -name '*.map' -delete || true
+
+# ============================================================
+# 阶段 2：生产依赖
+# ============================================================
+FROM ${NODE_IMAGE} AS prod-deps
+
+ARG NPM_REGISTRY=https://registry.npmjs.org
+WORKDIR /app
+
+RUN if [ "${NPM_REGISTRY}" != "https://registry.npmjs.org" ]; then \
+      printf 'registry=%s\nfund=false\naudit=false\n' "${NPM_REGISTRY}" > /root/.npmrc; \
+    fi
+
+COPY package.json package-lock.json ./
+COPY server/package.json server/package.json
+COPY web/package.json web/package.json
+
+RUN --mount=type=cache,target=/root/.npm \
+    npm ci --omit=dev --no-audit --no-fund
+
+# ============================================================
+# 阶段 3：抽取最小 Node 运行时
+# ============================================================
+FROM ${NODE_IMAGE} AS node-runtime
+
+# cp -L 把符号链接解引用成实体文件，并以 SONAME 命名 ——  distroless 基底里
+# 没有 /bin/sh，最终阶段无法再创建软链，必须在这一层准备好。
+RUN set -eu; \
+    mkdir -p /noderuntime/lib; \
+    cp /usr/local/bin/node /noderuntime/node; \
+    for name in libstdc++.so.6 libgcc_s.so.1; do \
+      f="$(find /usr/lib /lib -name "${name}" -print -quit 2>/dev/null || true)"; \
+      if [ -n "${f}" ]; then cp -L "${f}" "/noderuntime/lib/${name}"; \
+      else echo "缺少运行时库 ${name}" >&2; exit 1; fi; \
+    done; \
+    /usr/local/bin/node --version
+
+# ============================================================
+# 阶段 4：distroless 里需要预建的空目录
+# ============================================================
+FROM ${NODE_IMAGE} AS layout
+
+RUN mkdir -p /layout/data /layout/dns /layout/etc/headscale \
+             /layout/var/lib/headscale /layout/var/run/headscale
+
+# ============================================================
+# 阶段 5：最终镜像（官方 headscale 作为基底）
+# ============================================================
+FROM ${HEADSCALE_IMAGE} AS runtime
+
+ARG PANEL_VERSION=
+ARG VCS_REF=unknown
+ARG BUILD_DATE=unknown
+
+LABEL org.opencontainers.image.title="headscale-admin-allinone" \
+      org.opencontainers.image.description="单容器集成 headscale v0.29.7 与 headscale-admin 管理面板" \
+      org.opencontainers.image.version="${PANEL_VERSION:-see-package-json}" \
+      org.opencontainers.image.revision="${VCS_REF}" \
+      org.opencontainers.image.created="${BUILD_DATE}" \
+      org.opencontainers.image.licenses="MIT"
+
+WORKDIR /app
+
+# 官方镜像的 ENTRYPOINT 指向 headscale，这里换成监督器（Node 作为 PID 1）。
+# 不装 tini：监督器自己转发信号、回收两个子进程。
+ENV NODE_ENV=production \
+    PANEL_HOST=0.0.0.0 \
+    PANEL_PORT=3000 \
+    PANEL_DATA_DIR=/data \
+    HS_URL=http://127.0.0.1:8080 \
+    HEADSCALE_CONFIG=/etc/headscale/config.yaml \
+    LD_LIBRARY_PATH=/opt/node/lib \
+    TZ=Asia/Shanghai
+
+COPY --from=node-runtime /noderuntime/node /usr/local/bin/node
+COPY --from=node-runtime /noderuntime/lib/ /opt/node/lib/
+COPY --from=layout /layout/ /
+
+COPY --from=prod-deps /app/node_modules ./node_modules
+COPY --from=panel-build /app/server/dist ./server/dist
+COPY --from=panel-build /app/server/package.json ./server/package.json
+COPY --from=panel-build /app/web/dist ./web/dist
+COPY --from=panel-build /app/package.json ./package.json
+COPY scripts/allinone-supervisor.mjs ./supervisor.mjs
+COPY scripts/allinone-healthcheck.mjs ./healthcheck.mjs
+
+VOLUME ["/data", "/var/lib/headscale"]
+
+EXPOSE 3000 8080 3478/udp
+
+HEALTHCHECK --interval=20s --timeout=6s --start-period=45s --retries=5 \
+  CMD ["/usr/local/bin/node", "/app/healthcheck.mjs"]
+
+ENTRYPOINT ["/usr/local/bin/node", "/app/supervisor.mjs"]

@@ -15,7 +15,7 @@ import { authOr401, requirePermission, csrfOk } from '../auth/guard.ts';
 import { audit } from '../services/audit.ts';
 import { nowIso } from '../util/time.ts';
 import { hashPassword, checkPasswordStrength, generateStrongPassword } from '../auth/secrets.ts';
-import { revokeUserSessions, resolvePermissions } from '../auth/session.ts';
+import { revokeUserSessions, resolvePermissions, invalidateSessionCache } from '../auth/session.ts';
 import { PERMISSIONS, isPermission, ALL_PERMISSIONS } from '../auth/rbac.ts';
 import { notifyChanged } from '../realtime/hub.ts';
 
@@ -230,6 +230,8 @@ export async function registerUserRoutes(app: FastifyInstance): Promise<void> {
     params.push(nowIso(), id);
     run(`UPDATE panel_users SET ${sets.join(', ')} WHERE id = ?`, ...params);
 
+    // 改超管标记 / 启用状态会直接影响权限，必须让会话与权限缓存立即失效
+    invalidateSessionCache();
     if (parsed.data.isActive === false) revokeUserSessions(id);
     audit({ userId: ctx.user.id, username: ctx.user.username, ip: req.ip, action: 'panel.user.update', targetType: 'panel_user', targetId: id, detail: parsed.data });
     return reply.send({ ok: true });
@@ -365,6 +367,8 @@ export async function registerUserRoutes(app: FastifyInstance): Promise<void> {
       }
       return gid;
     });
+    // 新组可能已被立即授予给用户，权限集合必须重算
+    invalidateSessionCache();
     audit({ userId: ctx.user.id, username: ctx.user.username, ip: req.ip, action: 'panel.group.create', targetType: 'panel_group', targetId: id, detail: parsed.data });
     return reply.send({ ok: true, id });
   });
@@ -411,6 +415,8 @@ export async function registerUserRoutes(app: FastifyInstance): Promise<void> {
         }
       }
     });
+    // 组权限变更立即生效：不能让旧权限在缓存里多活一分钟
+    invalidateSessionCache();
     audit({ userId: ctx.user.id, username: ctx.user.username, ip: req.ip, action: 'panel.group.update', targetType: 'panel_group', targetId: id, detail: parsed.data });
     return reply.send({ ok: true });
   });
@@ -423,6 +429,8 @@ export async function registerUserRoutes(app: FastifyInstance): Promise<void> {
     if (!group) return reply.code(404).send({ error: 'NOT_FOUND', message: '用户组不存在' });
     if (group.is_builtin === 1) return reply.code(400).send({ error: 'PROTECTED', message: '内置角色不可删除' });
     run('DELETE FROM panel_groups WHERE id = ?', id);
+    // 删组会级联删除成员关系与权限，相关用户的权限集合全部变化
+    invalidateSessionCache();
     audit({ userId: ctx.user.id, username: ctx.user.username, ip: req.ip, action: 'panel.group.delete', targetType: 'panel_group', targetId: id, detail: { name: group.name } });
     return reply.send({ ok: true });
   });
@@ -441,6 +449,8 @@ export async function registerUserRoutes(app: FastifyInstance): Promise<void> {
         run('INSERT OR IGNORE INTO panel_user_groups (user_id, group_id) VALUES (?, ?)', id, gid);
       }
     });
+    // 必须先失效再算：否则 resolvePermissions 会命中改组前的缓存，回给前端一份过期权限
+    invalidateSessionCache();
     const perms = Array.from(resolvePermissions(id, get<{ is_superuser: number }>('SELECT is_superuser FROM panel_users WHERE id = ?', id)?.is_superuser === 1));
     audit({ userId: ctx.user.id, username: ctx.user.username, ip: req.ip, action: 'panel.user.set_groups', targetType: 'panel_user', targetId: id, detail: { groupIds: parsed.data.groupIds } });
     return reply.send({ ok: true, effectivePermissions: perms });

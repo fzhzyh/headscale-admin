@@ -58,6 +58,9 @@ ok()  { printf '  \033[32m✓\033[0m %s\n' "$*"; }
 die() { printf '  \033[31m✗\033[0m %s\n' "$*" >&2; exit "${2:-1}"; }
 
 running() { docker ps --format '{{.Names}}' | grep -qx "$1"; }
+# 用 compose 服务名判断更可靠：一体化 overlay 会改容器名（container_name），
+# 但服务 key 始终是 panel。容器名不匹配时按名字判断会误报「没在运行」。
+compose_running() { [ -n "$(docker compose ps --status running -q "$1" 2>/dev/null)" ]; }
 panel_node() { docker compose exec -T "$PANEL_SVC" node --no-warnings -e "$1"; }
 
 # ---------------------------------------------------------------- 前置检查
@@ -71,7 +74,8 @@ if ! docker info >/dev/null 2>&1; then
   die "无法连接 docker 守护进程（未启动，或当前用户不在 docker 组且 sudo 需要密码）" 2
 fi
 docker compose version >/dev/null 2>&1 || die "找不到 docker compose v2" 2
-running "$PANEL_CTR" || die "面板容器 $PANEL_CTR 没在运行（先 docker compose up -d）" 2
+compose_running "$PANEL_SVC" || running "$PANEL_CTR" \
+  || die "面板服务 $PANEL_SVC 没在运行（先 docker compose up -d）" 2
 
 mkdir -p "$DEST"
 echo "备份目标：$(cd "$DEST" && pwd)"
@@ -155,12 +159,25 @@ fi
 # 期间客户端会重连，对 tailnet 无实质影响）。目录里除了 db.sqlite
 # 还有 noise_private.key 与 derp 私钥 —— 丢了客户端全部失联、需重新注册，
 # 所以整个目录一起打包，不只拷库。
+#
+# ⚠️ 两种部署形态都要覆盖到：
+#   · 两容器方案（旧）：独立的 headscale 服务/容器
+#   · 一体化单容器（当前）：headscale 数据目录就在 panel 容器里，
+#     没有名为 headscale 的容器。若只按「容器名」判断，会静默跳过备份 ——
+#     备份产物看着齐全，恢复时才发现所有设备注册信息都没了。
+HS_BACKUP_SVC=""
 if running "$HS_CTR"; then
-  log "headscale 数据目录（短暂停容器以保证一致）"
+  HS_BACKUP_SVC="$HS_SVC"
+elif panel_node 'process.exit(require("node:fs").existsSync("/var/lib/headscale/db.sqlite") ? 0 : 1)' >/dev/null 2>&1; then
+  HS_BACKUP_SVC="$PANEL_SVC"
+fi
+
+if [ -n "$HS_BACKUP_SVC" ]; then
+  log "headscale 数据目录（短暂停 $HS_BACKUP_SVC 以保证一致）"
   HS_DIR="$DEST/headscale-$STAMP"
-  if docker compose stop "$HS_SVC" >/dev/null 2>&1; then
+  if docker compose stop "$HS_BACKUP_SVC" >/dev/null 2>&1; then
     mkdir -p "$HS_DIR"
-    if docker compose cp "$HS_SVC:/var/lib/headscale/." "$HS_DIR/" >/dev/null 2>&1; then
+    if docker compose cp "$HS_BACKUP_SVC:/var/lib/headscale/." "$HS_DIR/" >/dev/null 2>&1; then
       tar czf "$DEST/headscale-$STAMP.tar.gz" -C "$DEST" "headscale-$STAMP" 2>/dev/null \
         && rm -rf "$HS_DIR" \
         && ok "headscale-$STAMP.tar.gz（数据目录全量，含 noise/derp 私钥）" \
@@ -170,12 +187,13 @@ if running "$HS_CTR"; then
       rm -rf "$HS_DIR"
     fi
   else
-    log "  ⚠️ 停止 headscale 失败，跳过其备份（面板备份不受影响）"
+    log "  ⚠️ 停止 $HS_BACKUP_SVC 失败，跳过其备份（面板备份不受影响）"
   fi
-  # 无论上面成败都要把 headscale 拉起来
-  docker compose start "$HS_SVC" >/dev/null 2>&1 || log "  ⚠️ headscale 重启失败，请手工 docker compose start headscale"
+  # 无论上面成败都要把服务拉起来
+  docker compose start "$HS_BACKUP_SVC" >/dev/null 2>&1 \
+    || log "  ⚠️ $HS_BACKUP_SVC 重启失败，请手工 docker compose start $HS_BACKUP_SVC"
 else
-  log "（未发现 headscale 容器 —— 对接外部 headscale 的场景属正常，跳过）"
+  log "（未发现 headscale 数据 —— 对接外部 headscale 的场景属正常，跳过）"
 fi
 
 # ---------------------------------------------------------------- 清理
