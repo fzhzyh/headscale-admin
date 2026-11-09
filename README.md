@@ -226,7 +226,7 @@ docker build \
   --build-arg NODE_IMAGE=docker.m.daocloud.io/library/node \
   --build-arg NPM_REGISTRY=https://registry.npmmirror.com \
   --build-arg PANEL_VERSION=$(git describe --tags --always | sed 's/^v//') \
-  -t headscale-admin:1.0.0 .
+  -t headscale-admin:1.3.0 .
 
 # 默认（官方源）
 docker build -t headscale-admin:latest .

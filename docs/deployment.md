@@ -161,7 +161,7 @@ docker compose logs -f panel         # 首次会打印管理员账号与口令
 首次启动日志里会有类似：
 
 ```
-面板版本  1.1.0   监听 0.0.0.0:3000   数据库 /data/panel.sqlite   时序库 未配置
+面板版本  1.3.0   监听 0.0.0.0:3000   数据库 /data/panel.sqlite   时序库 未配置
 首次启动，已创建管理员账户：admin / Xk9mP2vQ7nR4
 ```
 
@@ -173,7 +173,7 @@ docker compose logs -f panel         # 首次会打印管理员账号与口令
 ```bash
 # 1. 进程健康（同时校验 DB 可达）
 curl -s localhost:3000/api/system/health
-# 期望：{"ok":true,"db":true,"panelVersion":"1.1.0",...}
+# 期望：{"ok":true,"db":true,"panelVersion":"1.3.0",...}
 
 # 2. ★ 关键：容器内能否访问 headscale
 docker compose exec panel node -e \
@@ -661,7 +661,7 @@ docker compose logs --tail 30 panel
 ```bash
 # 回滚到上一个 git tag
 git fetch --tags
-git checkout v1.1.0
+git checkout v1.2.1
 docker compose build panel
 docker compose up -d panel
 ```

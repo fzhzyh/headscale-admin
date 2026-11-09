@@ -35,23 +35,23 @@
 # ## 常用命令
 #
 #   # 基本构建（版本自动取 package.json）
-#   docker build -t headscale-admin:1.1.0 .
+#   docker build -t headscale-admin:1.3.0 .
 #
 #   # 国内网络（基础镜像与 npm 源都换）
 #   docker build \
 #     --build-arg NODE_IMAGE=docker.m.daocloud.io/library/node:22-alpine \
 #     --build-arg NPM_REGISTRY=https://registry.npmmirror.com \
-#     -t headscale-admin:1.1.0 .
+#     -t headscale-admin:1.3.0 .
 #
 #   # 多架构（amd64 + arm64），构建机需启用 buildx
 #   docker buildx build --platform linux/amd64,linux/arm64 \
-#     -t registry.example.com/headscale-admin:1.1.0 --push .
+#     -t registry.example.com/headscale-admin:1.3.0 --push .
 #
 #   # 带来源信息（CI 里用）
 #   docker build \
 #     --build-arg VCS_REF=$(git rev-parse --short HEAD) \
 #     --build-arg BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
-#     -t headscale-admin:1.1.0 .
+#     -t headscale-admin:1.3.0 .
 #
 # ## 构建缓存
 #

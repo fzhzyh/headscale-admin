@@ -49,7 +49,7 @@
 services:
   panel:
     # 一体化镜像；tag 默认跟随面板版本，可用 ALLINONE_IMAGE 覆盖
-    image: ${ALLINONE_IMAGE:-headscale-admin-allinone:1.2.1}
+    image: ${ALLINONE_IMAGE:-headscale-admin-allinone:1.3.0}
     build:
       context: .
       dockerfile: Dockerfile.allinone
